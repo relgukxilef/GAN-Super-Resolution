@@ -10,7 +10,7 @@ from tqdm import tqdm
 class GANSuperResolution:
     def __init__(
         self, session, continue_train = True, 
-        learning_rate = 2e-4, batch_size = 16
+        learning_rate = 1e-4, batch_size = 16
     ):
         self.session = session
         self.learning_rate = learning_rate
@@ -33,7 +33,7 @@ class GANSuperResolution:
                     tf.extract_image_patches(
                         [tf.image.decode_image(tf.read_file(path), 3)],
                         [1, self.size, self.size, 1], 
-                        [1, self.size // 1, self.size // 1, 1], 
+                        [1, self.size // 2, self.size // 2, 1], 
                         [1, 1, 1, 1], "VALID"
                     ),
                     [-1, self.size, self.size, 3]
@@ -88,14 +88,20 @@ class GANSuperResolution:
         
         
         # losses
-        fake_score = tf.reduce_mean(
-            [self.discriminate(cleaned), self.discriminate(scaled)]
+        fake_score = tf.concat(
+            [self.discriminate(cleaned), self.discriminate(scaled)], 0
         )
-        real_score = tf.reduce_mean(self.discriminate(real))
+        real_score = self.discriminate(real)
         
-        penalty = 0.1 * tf.reduce_mean( # DRAGAN penalty
+        def norm(x):
+            return tf.sqrt(tf.reduce_sum(tf.square(x), axis = [1, 2, 3]) + 1e-8)
+            
+        def log(x):
+            return tf.log(x + 1e-8)
+        
+        penalty = 10 * tf.reduce_mean( # DRAGAN penalty
             (
-                tf.norm(tf.gradients(
+                norm(tf.gradients(
                     self.discriminate(
                         real + tf.random_normal(
                             [self.batch_size, self.size, self.size, 3], 
@@ -121,27 +127,31 @@ class GANSuperResolution:
         self.downscaled = self.postprocess(downscaled)
         
         self.g_loss = (
-            -fake_score + 
-            0.001 * tf.reduce_mean(tf.abs(real - cleaned)) +
+            -tf.reduce_mean(log(fake_score)) + # non-saturating GAN
+            0.01 * tf.reduce_mean(tf.abs(real - cleaned)) +
             10 * tf.reduce_mean(tf.abs(real - downscaled))
         )
         
-        self.distance = fake_score - real_score
+        self.distance = tf.reduce_mean(fake_score) - tf.reduce_mean(real_score)
         
-        self.d_loss = self.distance + penalty
+        self.d_loss = (
+            -tf.reduce_mean(log(real_score)) + 
+            -tf.reduce_mean(log(1 - fake_score)) + 
+            penalty
+        )
         
         variables = tf.trainable_variables()
         g_variables = [v for v in variables if 'discriminate' not in v.name]
         d_variables = [v for v in variables if 'discriminate' in v.name]
         
         self.g_optimizer = tf.train.AdamOptimizer(
-            self.learning_rate, beta1 = 0.0, beta2 = 0.99, epsilon = 1e-8
+            self.learning_rate, beta1 = 0.5, beta2 = 0.9
         ).minimize(
-            self.g_loss, self.global_step, var_list = g_variables
+            self.g_loss, self.global_step#, var_list = g_variables
         )
 
         self.d_optimizer = tf.train.AdamOptimizer(
-            self.learning_rate, beta1 = 0.0, beta2 = 0.99, epsilon = 1e-8
+            self.learning_rate, beta1 = 0.5, beta2 = 0.9
         ).minimize(
             self.d_loss, var_list = d_variables
         )
@@ -298,9 +308,9 @@ class GANSuperResolution:
 
                 scm.imsave("samples/{}.png".format(step) , i)
                 
-            distance = 0
             for _ in tqdm(range(100)):
-                #for _ in range(4):
+                distance = 0
+                #for _ in range(2):
                 #while distance >= 0:
                 #    _, distance = self.session.run(
                 #        [self.d_optimizer, self.distance]
