@@ -1,6 +1,5 @@
 from derpibooru import Search, sort
 import requests
-import scipy.misc as scm
 from glob import glob
 
 image_path = "data/images/"
