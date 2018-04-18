@@ -10,7 +10,7 @@ from tqdm import tqdm
 class GANSuperResolution:
     def __init__(
         self, session, continue_train = True, 
-        learning_rate = 1e-4, batch_size = 32
+        learning_rate = 2.5e-4, batch_size = 32
     ):
         self.session = session
         self.learning_rate = learning_rate
@@ -23,8 +23,12 @@ class GANSuperResolution:
         self.size = 128
         
         # values calculated from 1200 random training tiles
-        self.lab_shift = tf.constant([[[[58.190086, 22.409063, -4.994123]]]])
-        self.lab_scale = tf.constant([[[[34.140823, 83.433235, 31.84137]]]])
+        self.lab_shift = tf.constant(
+            [[[[58.190086, 22.409063, -4.994123, 0]]]]
+        )
+        self.lab_scale = tf.constant(
+            [[[[34.140823, 83.433235, 31.84137, 1]]]]
+        )
 
         self.global_step = tf.Variable(0, name = 'global_step')
 
@@ -33,9 +37,9 @@ class GANSuperResolution:
         self.paths = glob("data/half/*.png")
                     
         def load(path):
-            image = tf.image.decode_image(tf.read_file(path), 3)
+            image = tf.image.decode_image(tf.read_file(path), 4)
             return tf.data.Dataset.from_tensor_slices([
-                tf.random_crop(image, [self.size, self.size, 3])
+                tf.random_crop(image, [self.size, self.size, 4])
                 for _ in range(10)
             ])
             #return tf.data.Dataset.from_tensor_slices(
@@ -84,8 +88,8 @@ class GANSuperResolution:
         self.lanczos3_horizontal = tf.constant(
             [
                 [[
-                    [a if o == i else 0 for o in range(3)]
-                    for i in range(3)
+                    [a if o == i else 0 for o in range(4)]
+                    for i in range(4)
                 ]] 
                 for a in lanczos3
             ]
@@ -93,8 +97,8 @@ class GANSuperResolution:
         self.lanczos3_vertical = tf.constant(
             [[
                 [
-                    [a if o == i else 0 for o in range(3)]
-                    for i in range(3)
+                    [a if o == i else 0 for o in range(4)]
+                    for i in range(4)
                 ]
                 for a in lanczos3
             ]]
@@ -103,7 +107,7 @@ class GANSuperResolution:
         d = tf.data.Dataset.from_tensor_slices(tf.constant(self.paths))
         d = d.shuffle(100000).repeat()
         d = d.flat_map(load).shuffle(2500)
-        d = d.batch(self.batch_size).prefetch(20)
+        d = d.batch(self.batch_size).prefetch(10)
         
         
         iterator = d.make_one_shot_iterator()
@@ -174,6 +178,13 @@ class GANSuperResolution:
             
         def log(x):
             return tf.log(x + 1e-8)
+        
+        self.distance = (
+            tf.reduce_mean(fake_logits) - tf.reduce_mean(real_logits)
+        )
+        #self.blur_distance = (
+        #    tf.reduce_mean(blur_logits) - tf.reduce_mean(real_logits)
+        #)
             
         ratio = tf.random_uniform([self.batch_size, 1, 1, 1])
         # DRAGAN penalty
@@ -189,19 +200,12 @@ class GANSuperResolution:
         #)
         
         self.g_loss = (
-            1e-2 * tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
+            2e-3 * tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
                 logits = fake_logits, labels = tf.ones_like(fake_logits)
             )) + # non-saturating GAN
             #1e0 * difference(real, cleaned) +
             1e0 * tf.reduce_mean(tf.abs(real - scaled))
         )
-        
-        self.distance = (
-            tf.reduce_mean(fake_logits) - tf.reduce_mean(real_logits)
-        )
-        #self.blur_distance = (
-        #    tf.reduce_mean(blur_logits) - tf.reduce_mean(real_logits)
-        #)
         
         self.d_loss = (
             1e0 * tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
@@ -216,13 +220,22 @@ class GANSuperResolution:
             #))
         )
         
-        # Fisher-GAN loss
-        #self.d_loss = (
+        # inspired by Fisher-GAN
+        #deviation = (
+        #    0.5 * tf.nn.moments(real_logits, [0, 1, 2, 3])[1] +
+        #    0.5 * tf.nn.moments(fake_logits, [0, 1, 2, 3])[1] +
+        #    1e-8
+        #)**0.5
+        #mahalanobis_distance = (
         #    (tf.reduce_mean(real_logits) - tf.reduce_mean(fake_logits)) /
-        #    (
-        #        0.5 * tf.reduce_mean(real_logits**2) + 
-        #        0.5 * tf.reduce_mean(fake_logits**2)
-        #    )**0.5
+        #    deviation
+        #)
+        #self.g_loss = (
+        #    1e-3 * -tf.reduce_mean(fake_logits) +
+        #    1e0 * tf.reduce_mean(tf.abs(real - scaled))
+        #)
+        #self.d_loss = ( # these summands are orthogonal
+        #    -mahalanobis_distance + tf.abs(deviation - 1)
         #)
         
         variables = tf.trainable_variables()
@@ -235,13 +248,14 @@ class GANSuperResolution:
         print(g_variables)
         
         self.g_optimizer = tf.train.AdamOptimizer(
-            self.learning_rate, beta1 = 0.5, beta2 = 0.9
+            self.learning_rate#, beta1 = 0.5, beta2 = 0.9
         ).minimize(
             self.g_loss, self.global_step, var_list = g_variables
         )
 
         self.d_optimizer = tf.train.AdamOptimizer(
-            self.learning_rate, beta1 = 0.5, beta2 = 0.9
+            self.learning_rate, #beta1 = 0.5, beta2 = 0.9
+            epsilon = 0.1
         ).minimize(
             self.d_loss, var_list = d_variables
         )
@@ -328,34 +342,42 @@ class GANSuperResolution:
             
     def srgb2xyz(self, c):
         c = tf.cast(c, tf.float32) / 255
+        c, alpha = tf.split(c, [3, 1], -1)
+        c = c * alpha # pre-multiply
         linear = tf.where(
             c <= 0.04045,
             c / 12.92,
             ((c + 0.055) / 1.055)**2.4
         )
-        return (
-            linear * [[[[0.4124, 0.2126, 0.0193]]]] +
-            linear * [[[[0.3576, 0.7152, 0.1192]]]] +
-            linear * [[[[0.1805, 0.0722, 0.9505]]]]
+        return tf.concat(
+            [
+                linear * [[[[0.4124564, 0.2126729, 0.0193339]]]] +
+                linear * [[[[0.3575761, 0.7151522, 0.1191920]]]] +
+                linear * [[[[0.1804375, 0.0721750, 0.9503041]]]],
+                alpha
+            ], -1
         )
         
     def xyz2srgb(self, c):
+        c, alpha = tf.split(c, [3, 1], -1)
         linear = (
-            c * [[[[3.2406, -0.9689, 0.0557]]]] +
-            c * [[[[-1.5372, 1.8758, -0.204]]]] +
-            c * [[[[-0.4986, 0.0415, 1.057]]]]
+            c * [[[[3.2404542, -0.9692660, 0.0556434]]]] +
+            c * [[[[-1.5371385, 1.8760108, -0.2040259]]]] +
+            c * [[[[-0.4985314, 0.0415560, 1.0572252]]]]
         )
         srgb = tf.where(
             linear <= 0.003131,
             12.92 * linear,
             1.055 * linear**(1 / 2.4) - 0.055
         )
+        srgb = srgb / tf.maximum(alpha, 1 / 255)
+        srgb = tf.concat([srgb, alpha], -1)
         return tf.cast(tf.minimum(tf.maximum(
             srgb * 255, 0
         ), 255), tf.int32)
         
     def xyz2ulab(self, c):
-        #c = tf.maximum(tf.minimum(c, 100), 0) # for stability
+        c, alpha = tf.split(c, [3, 1], -1)
         # https://en.wikipedia.org/wiki/Lab_color_space
         def f(t):
             return tf.where(
@@ -373,13 +395,14 @@ class GANSuperResolution:
             ],
             -1
         )
-        
+        lab = tf.concat([lab, alpha], -1)
         # normalize
         return (lab - self.lab_shift) / self.lab_scale
 
     def ulab2xyz(self, c):
         # denormalize
         lab = c * self.lab_scale + self.lab_shift
+        c, alpha = tf.split(c, [3, 1], -1)
         
         # https://en.wikipedia.org/wiki/Lab_color_space
         def f(t):
@@ -392,13 +415,12 @@ class GANSuperResolution:
         #l = tf.maximum(l, 0)
         x_n, y_n, z_n = 0.9505, 1.00, 1.089
         l2 = (l + 16) / 116
-        return tf.stack(
-            [
-                x_n * f(l2 + a / 500),
-                y_n * f(l2),
-                z_n * f(l2 - b / 200),
-            ]
-        , -1)
+        xyz = tf.stack([
+            x_n * f(l2 + a / 500),
+            y_n * f(l2),
+            z_n * f(l2 - b / 200)
+        ], -1)
+        return tf.concat([xyz, alpha], -1)
     
     def preprocess(self, images):
         #return self.srgb2xyz(images)
@@ -563,9 +585,6 @@ class GANSuperResolution:
         with tf.variable_scope(
             'denoise', reuse = tf.AUTO_REUSE
         ):
-            images = tf.pad(
-                images, [[0, 0], [0, 0], [0, 0], [0, 1]], constant_values = 1.0
-            )
             return self.unet(
                 images, self.filters, 3, 3,
                 None #self.classify(images, self.filters, 5)
@@ -578,41 +597,11 @@ class GANSuperResolution:
             #x = images * 2 - 1
             x = images
             
-            x = tf.pad(
-                x, [[0, 0], [0, 0], [0, 0], [0, 1]], constant_values = 1.0
-            )
-            
-            #x = sum([
-            #    atom(x, m, t) 
-            #    for m in [[], [2], [1], [1, 2]] 
-            #    for t in [[0, 1, 2, 3], [0, 2, 1, 3]]
-            #])
-            
-            #x = self.symmetric(
-            #    x,
-            #    lambda x: 
-            #    tf.depth_to_space(self.unet(x, self.filters, 2, 12), 2)
-            #)
-            
             x = tf.nn.selu(self.unet(x, self.filters, 2, 256))
-            #x = tf.pad(x, [[0, 0], [0, 0], [0, 0], [0, 3]]) # add fourth pixel
-            #x = tf.layers.conv2d(
-            #    x, 12,
-            #    [1, 1], [1, 1], 'same', name = 'conv1x1_final'
-            #)
             
             x = tf.layers.conv2d_transpose(
-                x, 3, [4, 4], [2, 2], 'same', name = 'deconv4x4'
+                x, 4, [4, 4], [2, 2], 'same', name = 'deconv4x4'
             )
-            
-            #x = tf.depth_to_space(x, 2)
-            
-            #x = tf.layers.conv2d_transpose(
-            #    x, 3, 
-            #    [2, 2], [2, 2], 'same', name = 'deconv2x2'
-            #)
-            
-            #x = x * 0.5 + 0.5
             
             # force result to be a valid upscale
             #x += tf.stop_gradient(
@@ -628,9 +617,6 @@ class GANSuperResolution:
         ):
             x = images * self.lab_scale / tf.reduce_mean(self.lab_scale)
 
-            #x = self.symmetric(
-            #    x, lambda x: self.classify(x, self.filters, 2, 1)
-            #)
             x = self.classify(x, self.filters, 2, 1)
             
             return x
