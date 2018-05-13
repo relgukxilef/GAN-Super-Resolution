@@ -10,7 +10,7 @@ from tqdm import tqdm
 class GANSuperResolution:
     def __init__(
         self, session, continue_train = True, 
-        learning_rate = 2.5e-4, batch_size = 32
+        learning_rate = 2.5e-4, batch_size = 8
     ):
         self.session = session
         self.learning_rate = learning_rate
@@ -82,9 +82,10 @@ class GANSuperResolution:
             ])
             
         lanczos3 = [
-            0.5 * 3 * sin(pi * x) * sin(pi * x / 3) / pi**2 / x**2
+            3 * sin(pi * x) * sin(pi * x / 3) / pi**2 / x**2
             for x in np.linspace(-2.75, 2.75, 12)
         ]
+        lanczos3 = [x / sum(lanczos3) for x in lanczos3]
         self.lanczos3_horizontal = tf.constant(
             [
                 [[
@@ -106,7 +107,7 @@ class GANSuperResolution:
         
         d = tf.data.Dataset.from_tensor_slices(tf.constant(self.paths))
         d = d.shuffle(100000).repeat()
-        d = d.flat_map(load).shuffle(2500)
+        d = d.flat_map(load).shuffle(1000)
         d = d.batch(self.batch_size).prefetch(10)
         
         
@@ -144,23 +145,25 @@ class GANSuperResolution:
         self.downscaled = self.postprocess(downscaled)
         
         #cleaned = self.denoise(tampered)
+        scaled_distribution = self.scale(
+            downscaled, tf.random_normal([self.batch_size, 1, 1, 8])
+        )
         scaled = self.scale(downscaled)
         
         #self.cleaned = self.postprocess(cleaned)
         self.scaled = self.postprocess(scaled)
+        self.scaled_distribution = self.postprocess(scaled_distribution)
         
         blurred = self.xyz2ulab(self.lanczos3_upscale(downscaled_xyz))
         
         # losses
         fake_logits = tf.concat(
             [
-                #self.discriminate(cleaned), 
-                self.discriminate(scaled)
-                #self.discriminate(blurred)
+                self.discriminate(scaled_distribution, downscaled)
             ], 0
         )
         #blur_logits = self.discriminate(blurred)
-        real_logits = self.discriminate(real)
+        real_logits = self.discriminate(real, downscaled)
         
         def norm(x):
             return tf.sqrt(tf.reduce_sum(tf.square(x), axis = [1, 2, 3]) + 1e-8)
@@ -199,26 +202,25 @@ class GANSuperResolution:
         #    (norm(tf.gradients(self.discriminate(noise), noise)) - 1e0) ** 2
         #)
         
-        self.g_loss = (
-            2e-3 * tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
+        self.g_loss = sum([
+            1e-2 * tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
                 logits = fake_logits, labels = tf.ones_like(fake_logits)
-            )) + # non-saturating GAN
-            #1e0 * difference(real, cleaned) +
-            1e0 * tf.reduce_mean(tf.abs(real - scaled))
-        )
-        
-        self.d_loss = (
-            1e0 * tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
+            )), # non-saturating GAN
+            #1e0 * difference(real, cleaned),
+            #1e-0 * difference(real, scaled_distribution)
+        ])
+        self.d_loss = sum([
+            1e-0 * tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
                 logits = real_logits, labels = tf.ones_like(real_logits)
-            )) + 
-            1e0 * tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
+            )),
+            1e-0 * tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
                 logits = fake_logits, labels = tf.zeros_like(fake_logits)
-            )) #+ 
+            )), 
             #1e0 * penalty
             #tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
             #    logits = blur_logits, labels = tf.zeros_like(blur_logits)
             #))
-        )
+        ])
         
         # inspired by Fisher-GAN
         #deviation = (
@@ -238,6 +240,16 @@ class GANSuperResolution:
         #    -mahalanobis_distance + tf.abs(deviation - 1)
         #)
         
+        # lsgan
+        #self.d_loss = (
+        #    tf.reduce_mean(tf.squared_difference(real_logits, 0.5)) + 
+        #    tf.reduce_mean(tf.squared_difference(fake_logits, -0.5))
+        #)
+        #self.g_loss = (
+        #    tf.reduce_mean(tf.squared_difference(fake_logits, 0.5)) +
+        #    difference(real, scaled)
+        #)
+        
         variables = tf.trainable_variables()
         g_variables = [v for v in variables if 'discriminate' not in v.name]
         d_variables = [v for v in variables if 'discriminate' in v.name]
@@ -248,17 +260,36 @@ class GANSuperResolution:
         print(g_variables)
         
         self.g_optimizer = tf.train.AdamOptimizer(
-            self.learning_rate#, beta1 = 0.5, beta2 = 0.9
+            self.learning_rate, beta1 = 0.5#, beta2 = 0.9
         ).minimize(
             self.g_loss, self.global_step, var_list = g_variables
         )
 
         self.d_optimizer = tf.train.AdamOptimizer(
-            self.learning_rate, #beta1 = 0.5, beta2 = 0.9
-            epsilon = 0.1
+            self.learning_rate, beta1 = 0.5#, beta2 = 0.9#, epsilon = 1e-1
         ).minimize(
             self.d_loss, var_list = d_variables
         )
+        
+        
+        real_gradients = tf.norm(
+            tf.gradients(real_logits, real)[0], axis = -1
+        )
+        fake_gradients = tf.norm(
+            tf.gradients(fake_logits, scaled_distribution)[0], axis = -1
+        )
+        visualisation = tf.stack([real_gradients, fake_gradients], -1)
+        visualisation /= tf.reduce_mean(visualisation) * 4
+        visualisation = tf.concat([
+            visualisation,
+            tf.stack([
+                tf.zeros_like(real_gradients), 
+                tf.ones_like(real_gradients)
+            ], -1)
+        ], -1)
+        self.visualisation = tf.cast(tf.minimum(tf.maximum(
+            visualisation * 255, 0
+        ), 255), tf.int32)
         
         
         #padded_kernels = tf.concat([
@@ -354,7 +385,7 @@ class GANSuperResolution:
                 linear * [[[[0.4124564, 0.2126729, 0.0193339]]]] +
                 linear * [[[[0.3575761, 0.7151522, 0.1191920]]]] +
                 linear * [[[[0.1804375, 0.0721750, 0.9503041]]]],
-                alpha
+                tf.ones_like(alpha)
             ], -1
         )
         
@@ -512,10 +543,13 @@ class GANSuperResolution:
                 ))
             ) * 0.5**0.5
     
-    def unet(self, input, filters, depth, outputs, context = None):
+    def transform(self, input, filters, depth, outputs, noise = None):
         with tf.variable_scope(
-            'unet', reuse = tf.AUTO_REUSE
+            'transform', reuse = tf.AUTO_REUSE
         ):
+            if noise is None:
+                noise = tf.zeros([tf.shape(input)[0], 1, 1, 8])
+        
             x = input
                         
             x = tf.nn.selu(tf.layers.conv2d(
@@ -523,30 +557,40 @@ class GANSuperResolution:
                 [3, 3], [1, 1], 'same', name = 'conv3x3_1'
             ))
             
+            x = x + tf.layers.dense(noise, 16, use_bias = False)
+            
             x = tf.nn.selu(tf.layers.conv2d(
                 x, 32,
                 [3, 3], [1, 1], 'same', name = 'conv3x3_2'
             ))
+            
+            x = x + tf.layers.dense(noise, 32, use_bias = False)
             
             x = tf.nn.selu(tf.layers.conv2d(
                 x, 64,
                 [3, 3], [1, 1], 'same', name = 'conv3x3_3'
             ))
             
+            x = x + tf.layers.dense(noise, 64, use_bias = False)
+            
             x = tf.nn.selu(tf.layers.conv2d(
                 x, 128,
                 [3, 3], [1, 1], 'same', name = 'conv3x3_4'
             ))
             
-            x = tf.nn.selu(tf.layers.conv2d(
-                x, 128,
-                [3, 3], [1, 1], 'same', name = 'conv3x3_5'
-            ))
+            x = x + tf.layers.dense(noise, 128, use_bias = False)
+            
+            #x = tf.nn.selu(tf.layers.conv2d(
+            #    x, 128,
+            #    [3, 3], [1, 1], 'same', name = 'conv3x3_5'
+            #))
             
             x = tf.layers.conv2d(
                 x, outputs,
                 [3, 3], [1, 1], 'same', name = 'conv1x1'
             )
+            
+            x = x + tf.layers.dense(noise, outputs, use_bias = False)
             
             return x
         
@@ -554,30 +598,7 @@ class GANSuperResolution:
         with tf.variable_scope(
             'classify', reuse = tf.AUTO_REUSE
         ):            
-            x = tf.nn.selu(tf.layers.conv2d(
-                x, 16,
-                [3, 3], [1, 1], 'valid', name = 'conv3x3_1'
-            ))
-            
-            x = tf.nn.selu(tf.layers.conv2d(
-                x, 32,
-                [3, 3], [1, 1], 'valid', name = 'conv3x3_2'
-            ))
-            
-            x = tf.nn.selu(tf.layers.conv2d(
-                x, 32,
-                [3, 3], [1, 1], 'valid', name = 'conv3x3_3'
-            ))
-            
-            x = tf.reduce_mean(x, [1, 2], True)# * self.size
-            
-            # dense again to react to global properties
-            x = tf.nn.selu(tf.layers.conv2d(
-                x, 32, [1, 1], name = 'dense_1'
-            ))
-            x = tf.layers.conv2d(
-                x, outputs, [1, 1], name = 'dense_2'
-            )
+            # TODO
             
             return x
 
@@ -585,22 +606,36 @@ class GANSuperResolution:
         with tf.variable_scope(
             'denoise', reuse = tf.AUTO_REUSE
         ):
-            return self.unet(
+            return self.transform(
                 images, self.filters, 3, 3,
                 None #self.classify(images, self.filters, 5)
             )
             
-    def scale(self, images):
+    def scale(self, images, noise = None):
         with tf.variable_scope(
             'scale', reuse = tf.AUTO_REUSE
         ):
             #x = images * 2 - 1
             x = images
             
-            x = tf.nn.selu(self.unet(x, self.filters, 2, 256))
+            x = tf.nn.selu(self.transform(x, self.filters, 2, 256, noise))
             
             x = tf.layers.conv2d_transpose(
-                x, 4, [4, 4], [2, 2], 'same', name = 'deconv4x4'
+                x, 3, [4, 4], [2, 2], 'same', name = 'deconv4x4'
+            )
+            
+            #noise = tf.random_normal(tf.concat([tf.shape(x)[:3], [3]], 0))
+            #
+            #x = (
+            #    x[:, :, :, 0:3] +
+            #    x[:, :, :, 3:6] * noise[:, :, :, 0:1] +
+            #    x[:, :, :, 6:9] * noise[:, :, :, 1:2] +
+            #    x[:, :, :, 9:12] * noise[:, :, :, 2:3]
+            #)
+            
+            x = tf.pad(
+                x,
+                [[0, 0], [0, 0], [0, 0], [0, 1]], constant_values = 1.0
             )
             
             # force result to be a valid upscale
@@ -611,13 +646,57 @@ class GANSuperResolution:
             
             return x
             
-    def discriminate(self, images):
+    def discriminate(self, large_images, small_images):
         with tf.variable_scope(
             'discriminate', reuse = tf.AUTO_REUSE
         ):
-            x = images * self.lab_scale / tf.reduce_mean(self.lab_scale)
+            large_images *= self.lab_scale / tf.reduce_mean(self.lab_scale)
+            small_images *= self.lab_scale / tf.reduce_mean(self.lab_scale)
+            
+            # cut away alpha
+            small_images = small_images[:, :, :, :3]
+            x = large_images[:, :, :, :3]
 
-            x = self.classify(x, self.filters, 2, 1)
+            x = tf.nn.selu(tf.layers.conv2d(
+                x, 16,
+                [3, 3], [1, 1], 'valid', name = 'conv3x3_1'
+            ))
+            
+            #x = tf.nn.selu(tf.layers.conv2d(
+            #    x, 16,
+            #    [3, 3], [1, 1], 'valid', name = 'conv3x3_2'
+            #))
+            
+            #x = tf.nn.selu(tf.layers.conv2d(
+            #    x, 16,
+            #    [3, 3], [1, 1], 'valid', name = 'conv3x3_2.1'
+            #))
+            
+            #x = tf.layers.average_pooling2d(x, 2, 2)
+            
+            x = tf.nn.selu(tf.layers.conv2d(
+                x, 16,
+                [4, 4], [2, 2], 'valid', name = 'conv4x4_2.2'
+            ))
+            
+            x = tf.concat([x, small_images[:, 1:-1, 1:-1, :]], -1)
+            
+            x = tf.nn.selu(tf.layers.conv2d(
+                x, 16,
+                [3, 3], [1, 1], 'valid', name = 'conv3x3_3'
+            ))
+            
+            #x = tf.nn.selu(tf.layers.conv2d(
+            #    x, 32,
+            #    [3, 3], [1, 1], 'valid', name = 'conv3x3_4'
+            #))
+            
+            x = tf.layers.conv2d(
+                x, 1,
+                [3, 3], [1, 1], 'valid', name = 'conv3x3_4'
+            )
+            
+            x = tf.reduce_mean(x, [1, 2], True)# * self.size
             
             return x
  
@@ -627,13 +706,16 @@ class GANSuperResolution:
         while True:
             while True:
                 try:
-                    real, downscaled, scaled, g_loss, d_loss, distance, summary = \
+                    real, downscaled, scaled, visualisation, \
+                    g_loss, d_loss, distance, summary = \
                         self.session.run([
                             self.real[:8, :, :, :],
                             self.downscaled[:8, :, :, :],
                             #self.tampered[:4, :, :, :],
                             #self.cleaned[:4, :, :, :],
                             self.scaled[:8, :, :, :],
+                            self.scaled_distribution[:8, :, :, :],
+                            #self.visualisation[:8, :, :, :],
                             self.g_loss, self.d_loss, 
                             self.distance,
                             self.summary
@@ -656,8 +738,10 @@ class GANSuperResolution:
                     #tampered, 
                     #cleaned, 
                     scaled[:4, :, :, :],
+                    visualisation[:4, :, :, :],
                     real[4:, :, :, :],
-                    scaled[4:, :, :, :]
+                    scaled[4:, :, :, :],
+                    visualisation[4:, :, :, :],
                 ),
                 axis = 2
             )
@@ -669,7 +753,7 @@ class GANSuperResolution:
         
             self.summary_writer.add_summary(summary, step)
                 
-            for _ in tqdm(range(250)):
+            for _ in tqdm(range(1000)):
                 distance = 0
                 #for _ in range(2):
                 #while distance >= 0:
@@ -690,7 +774,7 @@ class GANSuperResolution:
                     except tf.errors.InvalidArgumentError as e:
                         print(e.message)
                 
-            if step % 1000 == 0:
+            if step % 4000 == 0:
                 pass
                 print("saving iteration " + str(step))
                 self.saver.save(
