@@ -144,7 +144,10 @@ class GANSuperResolution:
         
         self.downscaled = self.postprocess(downscaled)
         
-        encoded = self.encode(real)
+        encoded_mean, encoded_deviation = self.encode(real)
+        encoded = encoded_mean + encoded_deviation * tf.random_normal(
+            tf.shape(encoded_mean)
+        )
         reconstructed = self.scale(downscaled, encoded)
         
         #cleaned = self.denoise(tampered)
@@ -184,38 +187,29 @@ class GANSuperResolution:
                 self.lab_scale / tf.reduce_mean(self.lab_scale)
             )
             
-        def log(x):
-            return tf.log(x + 1e-8)
+        def divergence(mean, deviation):
+            # from
+            # https://github.com/shaohua0116/VAE-Tensorflow/blob/master/demo.py
+            return tf.reduce_mean(
+                0.5 * tf.reduce_sum(
+                    tf.square(mean) +
+                    tf.square(deviation) -
+                    tf.log(1e-6 + tf.square(deviation)) - 1,
+                    3
+                )
+            )
         
         self.distance = (
             tf.reduce_mean(fake_logits) - tf.reduce_mean(real_logits)
         )
         
+        divergence_loss = divergence(encoded_mean, encoded_deviation)
+        self.divergence_loss = divergence_loss
+        
         self.g_loss = sum([
-            1e-2 * tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
-                logits = fake_logits, labels = tf.ones_like(fake_logits)
-            )), # non-saturating GAN
+            2e-3 * tf.maximum(divergence_loss, 0.01),
             1e-0 * difference(real, reconstructed)
         ])
-        self.d_loss = sum([
-            1e-0 * tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
-                logits = real_logits, labels = tf.ones_like(real_logits)
-            )),
-            1e-0 * tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
-                logits = fake_logits, labels = tf.zeros_like(fake_logits)
-            )), 
-            #1e0 * penalty,
-        ])
-        
-        # lsgan
-        #self.d_loss = (
-        #    tf.reduce_mean(tf.squared_difference(real_logits, 0.5)) + 
-        #    tf.reduce_mean(tf.squared_difference(fake_logits, -0.5))
-        #)
-        #self.g_loss = (
-        #    tf.reduce_mean(tf.squared_difference(fake_logits, 0.5)) +
-        #    difference(real, scaled)
-        #)
         
         variables = tf.trainable_variables()
         g_variables = [v for v in variables if 'discriminate' not in v.name]
@@ -227,16 +221,16 @@ class GANSuperResolution:
         print(g_variables)
         
         self.g_optimizer = tf.train.AdamOptimizer(
-            self.learning_rate, beta1 = 0.5#, beta2 = 0.9
+            self.learning_rate#, beta1 = 0.5#, beta2 = 0.9
         ).minimize(
             self.g_loss, self.global_step, var_list = g_variables
         )
 
-        self.d_optimizer = tf.train.AdamOptimizer(
-            self.learning_rate, beta1 = 0.5#, beta2 = 0.9#, epsilon = 1e-1
-        ).minimize(
-            self.d_loss, var_list = d_variables
-        )
+        #self.d_optimizer = tf.train.AdamOptimizer(
+        #    self.learning_rate, beta1 = 0.5#, beta2 = 0.9#, epsilon = 1e-1
+        #).minimize(
+        #    self.d_loss, var_list = d_variables
+        #)
         
         
         real_gradients = tf.norm(
@@ -262,7 +256,7 @@ class GANSuperResolution:
         self.saver = tf.train.Saver(max_to_keep = 2)
         
         tf.summary.scalar('generator loss', self.g_loss)
-        tf.summary.scalar('discriminator loss', self.d_loss)
+        #tf.summary.scalar('discriminator loss', self.d_loss)
         tf.summary.scalar('distance', self.distance)
         tf.summary.histogram('fake score', fake_logits)
         tf.summary.histogram('real score', real_logits)
@@ -418,10 +412,17 @@ class GANSuperResolution:
                 [3, 3], [1, 1], 'same', name = 'conv3x3_2'
             ))
             
-            return tf.layers.conv2d(
-                x, 12,
-                [4, 4], [2, 2], 'same', name = 'conv3x3_3'
+            x = tf.nn.selu(tf.layers.conv2d(
+                x, 32,
+                [3, 3], [1, 1], 'same', name = 'conv3x3_3'
+            ))
+            
+            final = tf.layers.conv2d(
+                x, 12 * 2,
+                [4, 4], [2, 2], 'same', name = 'conv3x3_4'
             )
+            
+            return final[:, :, :, :12], tf.nn.softplus(final[:, :, :, 12:])
     
     def decode(self, x):
         with tf.variable_scope(
@@ -541,17 +542,19 @@ class GANSuperResolution:
         while True:
             while True:
                 try:
-                    real, downscaled, scaled, visualisation, \
-                    g_loss, d_loss, distance, summary = \
+                    real, downscaled, scaled_distribution, scaled, \
+                    reconstructed, \
+                    g_loss, divergence_loss, distance, summary = \
                         self.session.run([
                             self.real[:8, :, :, :],
                             self.downscaled[:8, :, :, :],
                             #self.tampered[:4, :, :, :],
                             #self.cleaned[:4, :, :, :],
+                            self.scaled_distribution[:8, :, :, :],
                             self.scaled[:8, :, :, :],
                             self.reconstructed[:8, :, :, :],
                             #self.visualisation[:8, :, :, :],
-                            self.g_loss, self.d_loss, 
+                            self.g_loss, self.divergence_loss,
                             self.distance,
                             self.summary
                         ])
@@ -561,8 +564,8 @@ class GANSuperResolution:
                 
             print(
                 (
-                    "#{}, g_loss: {:.4f}, d_loss: {:.4f}, distance: {:.4f}"
-                ).format(step, g_loss, d_loss, distance)
+                    "#{}, g_loss: {:.4f}, divergence: {:.4f}"
+                ).format(step, g_loss, divergence_loss)
             )
             
             #real[:, :self.size // 2, :self.size // 2, :] = downscaled
@@ -570,13 +573,14 @@ class GANSuperResolution:
             i = np.concatenate(
                 (
                     real[:4, :, :, :], 
-                    #tampered, 
-                    #cleaned, 
                     scaled[:4, :, :, :],
-                    visualisation[:4, :, :, :],
+                    scaled_distribution[:4, :, :, :],
+                    reconstructed[:4, :, :, :],
+                    
                     real[4:, :, :, :],
                     scaled[4:, :, :, :],
-                    visualisation[4:, :, :, :],
+                    scaled_distribution[4:, :, :, :],
+                    reconstructed[4:, :, :, :],
                 ),
                 axis = 2
             )
@@ -600,7 +604,7 @@ class GANSuperResolution:
                     try:
                         _, step = self.session.run([
                             [
-                                self.d_optimizer, 
+                                #self.d_optimizer, 
                                 self.g_optimizer
                             ],
                             self.global_step
