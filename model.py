@@ -144,15 +144,21 @@ class GANSuperResolution:
         
         self.downscaled = self.postprocess(downscaled)
         
+        encoded = self.encode(real)
+        reconstructed = self.scale(downscaled, encoded)
+        
         #cleaned = self.denoise(tampered)
         scaled_distribution = self.scale(
-            downscaled, tf.random_normal([self.batch_size, 1, 1, 8])
+            downscaled, tf.random_normal(tf.shape(encoded))
         )
-        scaled = self.scale(downscaled)
+        scaled = self.scale(
+            downscaled, tf.zeros_like(encoded)
+        )
         
         #self.cleaned = self.postprocess(cleaned)
         self.scaled = self.postprocess(scaled)
         self.scaled_distribution = self.postprocess(scaled_distribution)
+        self.reconstructed = self.postprocess(reconstructed)
         
         blurred = self.xyz2ulab(self.lanczos3_upscale(downscaled_xyz))
         
@@ -162,7 +168,6 @@ class GANSuperResolution:
                 self.discriminate(scaled_distribution, downscaled)
             ], 0
         )
-        #blur_logits = self.discriminate(blurred)
         real_logits = self.discriminate(real, downscaled)
         
         def norm(x):
@@ -185,29 +190,12 @@ class GANSuperResolution:
         self.distance = (
             tf.reduce_mean(fake_logits) - tf.reduce_mean(real_logits)
         )
-        #self.blur_distance = (
-        #    tf.reduce_mean(blur_logits) - tf.reduce_mean(real_logits)
-        #)
-            
-        ratio = tf.random_uniform([self.batch_size, 1, 1, 1])
-        # DRAGAN penalty
-        #noise = real + tf.random_normal(
-        #    [self.batch_size, self.size, self.size, 3], 
-        #    0, tf.sqrt(tf.nn.moments(real, [0, 1, 2, 3])[1])
-        #) * ratio
-        # WGAN loss
-        #noise = real * (1 - ratio) + scaled * ratio
-        
-        #penalty = tf.reduce_mean(
-        #    (norm(tf.gradients(self.discriminate(noise), noise)) - 1e0) ** 2
-        #)
         
         self.g_loss = sum([
             1e-2 * tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
                 logits = fake_logits, labels = tf.ones_like(fake_logits)
             )), # non-saturating GAN
-            #1e0 * difference(real, cleaned),
-            #1e-0 * difference(real, scaled_distribution)
+            1e-0 * difference(real, reconstructed)
         ])
         self.d_loss = sum([
             1e-0 * tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
@@ -216,29 +204,8 @@ class GANSuperResolution:
             1e-0 * tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
                 logits = fake_logits, labels = tf.zeros_like(fake_logits)
             )), 
-            #1e0 * penalty
-            #tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
-            #    logits = blur_logits, labels = tf.zeros_like(blur_logits)
-            #))
+            #1e0 * penalty,
         ])
-        
-        # inspired by Fisher-GAN
-        #deviation = (
-        #    0.5 * tf.nn.moments(real_logits, [0, 1, 2, 3])[1] +
-        #    0.5 * tf.nn.moments(fake_logits, [0, 1, 2, 3])[1] +
-        #    1e-8
-        #)**0.5
-        #mahalanobis_distance = (
-        #    (tf.reduce_mean(real_logits) - tf.reduce_mean(fake_logits)) /
-        #    deviation
-        #)
-        #self.g_loss = (
-        #    1e-3 * -tf.reduce_mean(fake_logits) +
-        #    1e0 * tf.reduce_mean(tf.abs(real - scaled))
-        #)
-        #self.d_loss = ( # these summands are orthogonal
-        #    -mahalanobis_distance + tf.abs(deviation - 1)
-        #)
         
         # lsgan
         #self.d_loss = (
@@ -291,30 +258,6 @@ class GANSuperResolution:
             visualisation * 255, 0
         ), 255), tf.int32)
         
-        
-        #padded_kernels = tf.concat([
-        #    tf.pad([
-        #        v for v in tf.trainable_variables() 
-        #        if v.name == 'scale/conv3x3_1/kernel:0'
-        #    ][0], [[1, 1], [1, 1], [0, 0], [0, 0]]),
-        #    tf.pad([
-        #        v for v in tf.trainable_variables() 
-        #        if v.name == 'scale/conv3x3_2/kernel:0'
-        #    ][0], [[1, 1], [1, 1], [0, 0], [0, 0]]),
-        #    tf.pad([
-        #        v for v in tf.trainable_variables() 
-        #        if v.name == 'scale/conv3x3_3/kernel:0'
-        #    ][0], [[1, 1], [1, 1], [0, 0], [0, 1]])
-        #], 3)
-        #
-        #kernel_grid = tf.to_float(self.postprocess([
-        #    tf.concat([
-        #        tf.concat([
-        #            padded_kernels[:, :, :3, x * 8 + y]
-        #            for x in range(8)
-        #        ], 1) for y in range(8)
-        #    ], 0)
-        #]))
 
         self.saver = tf.train.Saver(max_to_keep = 2)
         
@@ -461,188 +404,80 @@ class GANSuperResolution:
         #return self.xyz2srgb(images)
         return self.xyz2srgb(self.ulab2xyz(images))
         
-    def depth_wise_conv2d(
-        self, input, filters, kernel_size, stride = [1, 1], 
-        padding = 'VALID', name = 'depth_wise_conv2d'
-    ):
-        # TODO: this is like grayscaling before a convolution 
-        # but more complicated
+    def encode(self, x):
         with tf.variable_scope(
-            name, reuse = tf.AUTO_REUSE
+            'encode', reuse = tf.AUTO_REUSE
         ):
-            kernel = tf.tile(tf.get_variable(
-                'kernel', 
-                [kernel_size[0], kernel_size[1], 1, filters]
-            ), [1, 1, tf.shape(input)[-1], 1])
-            bias = tf.get_variable(
-                'bias',
-                [1, 1, 1, filters]
-            )
-            return tf.nn.conv2d(
-                input, kernel, [1] + stride + [1], padding
-            ) + bias
-        
-    def symmetric_conv2d(
-        self, input, filters, kernel_size, stride = [1, 1], 
-        padding = 'VALID', name = 'symmetric_conv2d'
-    ):
-        with tf.variable_scope(
-            name, reuse = tf.AUTO_REUSE
-        ):
-            kernel = tf.get_variable(
-                'kernel', 
-                [kernel_size[0], kernel_size[1], input.shape[3], filters]
-            )
-            symmetric_kernel = tf.concat([
-                tf.reverse(tf.transpose(kernel, t), m)
-                for m in [[], [0], [1], [0, 1]] 
-                for t in [[0, 1, 2, 3], [1, 0, 2, 3]]
-            ], -1)
-            bias = tf.get_variable(
-                'bias',
-                [1, 1, 1, filters]
-            )
-            symmetric_bias = tf.tile(bias, [1, 1, 1, 8])
-            return tf.nn.conv2d(
-                input, kernel, [1] + stride + [1], padding
-            ) + bias
-            
-    def symmetric(self, input, function):
-        p = [
-            (r, t) 
-            for r in [[], [2], [1], [1, 2]] 
-            for t in [[0, 1, 2, 3], [0, 2, 1, 3]]
-        ]
-        # permutations to batches
-        x = tf.concat([tf.transpose(tf.reverse(input, r), t) for r, t in p], 0) 
-        
-        x = function(x)
-        
-        # sum up permutations
-        x = tf.split(x, len(p))
-        x = sum(
-            [tf.reverse(tf.transpose(i, t), r) for i, (r, t) in zip(x, p)]
-        ) / len(p)**0.5 # normalize
-        return x
-    
-    def cross_conv2d(
-        self, input, filters, kernel_size, stride = [1, 1], 
-        padding = 'VALID', name = 'cross_conv2d'
-    ):
-        with tf.variable_scope(
-            name, reuse = tf.AUTO_REUSE
-        ):
-            return (
-                tf.nn.selu(tf.layers.conv2d(
-                    input, filters,
-                    [1, kernel_size[1]], stride, padding, name = 'horizontal'
-                )) + 
-                tf.nn.selu(tf.layers.conv2d(
-                    input, filters,
-                    [kernel_size[0], 1], stride, padding, name = 'vertical'
-                ))
-            ) * 0.5**0.5
-    
-    def transform(self, input, filters, depth, outputs, noise = None):
-        with tf.variable_scope(
-            'transform', reuse = tf.AUTO_REUSE
-        ):
-            if noise is None:
-                noise = tf.zeros([tf.shape(input)[0], 1, 1, 8])
-        
-            x = input
-                        
             x = tf.nn.selu(tf.layers.conv2d(
                 x, 16,
                 [3, 3], [1, 1], 'same', name = 'conv3x3_1'
             ))
-            
-            x = x + tf.layers.dense(noise, 16, use_bias = False)
             
             x = tf.nn.selu(tf.layers.conv2d(
                 x, 32,
                 [3, 3], [1, 1], 'same', name = 'conv3x3_2'
             ))
             
-            x = x + tf.layers.dense(noise, 32, use_bias = False)
+            return tf.layers.conv2d(
+                x, 12,
+                [4, 4], [2, 2], 'same', name = 'conv3x3_3'
+            )
+    
+    def decode(self, x):
+        with tf.variable_scope(
+            'transform', reuse = tf.AUTO_REUSE
+        ):
+            x = tf.nn.selu(tf.layers.conv2d(
+                x, 16,
+                [3, 3], [1, 1], 'same', name = 'conv3x3_1'
+            ))
+            
+            x = tf.nn.selu(tf.layers.conv2d(
+                x, 32,
+                [3, 3], [1, 1], 'same', name = 'conv3x3_2'
+            ))
             
             x = tf.nn.selu(tf.layers.conv2d(
                 x, 64,
                 [3, 3], [1, 1], 'same', name = 'conv3x3_3'
             ))
             
-            x = x + tf.layers.dense(noise, 64, use_bias = False)
-            
             x = tf.nn.selu(tf.layers.conv2d(
                 x, 128,
                 [3, 3], [1, 1], 'same', name = 'conv3x3_4'
             ))
-            
-            x = x + tf.layers.dense(noise, 128, use_bias = False)
             
             #x = tf.nn.selu(tf.layers.conv2d(
             #    x, 128,
             #    [3, 3], [1, 1], 'same', name = 'conv3x3_5'
             #))
             
-            x = tf.layers.conv2d(
-                x, outputs,
-                [3, 3], [1, 1], 'same', name = 'conv1x1'
-            )
-            
-            x = x + tf.layers.dense(noise, outputs, use_bias = False)
-            
-            return x
-        
-    def classify(self, x, filters, depth, outputs):
-        with tf.variable_scope(
-            'classify', reuse = tf.AUTO_REUSE
-        ):            
-            # TODO
-            
-            return x
-
-    def denoise(self, images):
-        with tf.variable_scope(
-            'denoise', reuse = tf.AUTO_REUSE
-        ):
-            return self.transform(
-                images, self.filters, 3, 3,
-                None #self.classify(images, self.filters, 5)
-            )
-            
-    def scale(self, images, noise = None):
-        with tf.variable_scope(
-            'scale', reuse = tf.AUTO_REUSE
-        ):
-            #x = images * 2 - 1
-            x = images
-            
-            x = tf.nn.selu(self.transform(x, self.filters, 2, 256, noise))
+            x = tf.nn.selu(tf.layers.conv2d(
+                x, 256,
+                [3, 3], [1, 1], 'same', name = 'conv3x3_6'
+            ))
             
             x = tf.layers.conv2d_transpose(
                 x, 3, [4, 4], [2, 2], 'same', name = 'deconv4x4'
             )
             
-            #noise = tf.random_normal(tf.concat([tf.shape(x)[:3], [3]], 0))
-            #
-            #x = (
-            #    x[:, :, :, 0:3] +
-            #    x[:, :, :, 3:6] * noise[:, :, :, 0:1] +
-            #    x[:, :, :, 6:9] * noise[:, :, :, 1:2] +
-            #    x[:, :, :, 9:12] * noise[:, :, :, 2:3]
-            #)
+            return x
+            
+    def scale(self, images, noise = None):
+        with tf.variable_scope(
+            'scale', reuse = tf.AUTO_REUSE
+        ):
+            if noise is None:
+                noise = tf.zeros(tf.concat([tf.shape(images)[0:2], [12]], 0))
+        
+            x = tf.concat([images, noise], -1)
+            
+            x = self.decode(x)
             
             x = tf.pad(
                 x,
                 [[0, 0], [0, 0], [0, 0], [0, 1]], constant_values = 1.0
             )
-            
-            # force result to be a valid upscale
-            #x += tf.stop_gradient(
-            #    self.xyz2ulab(self.lanczos3_upscale(self.ulab2xyz(images))) -
-            #    self.xyz2ulab(self.lanczos3_upscale(self.lanczos3_downscale(self.ulab2xyz(x))))
-            #)
             
             return x
             
@@ -714,7 +549,7 @@ class GANSuperResolution:
                             #self.tampered[:4, :, :, :],
                             #self.cleaned[:4, :, :, :],
                             self.scaled[:8, :, :, :],
-                            self.scaled_distribution[:8, :, :, :],
+                            self.reconstructed[:8, :, :, :],
                             #self.visualisation[:8, :, :, :],
                             self.g_loss, self.d_loss, 
                             self.distance,
