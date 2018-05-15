@@ -10,7 +10,7 @@ from tqdm import tqdm
 class GANSuperResolution:
     def __init__(
         self, session, continue_train = True, 
-        learning_rate = 2.5e-4, batch_size = 8
+        learning_rate = 2.5e-4, batch_size = 4
     ):
         self.session = session
         self.learning_rate = learning_rate
@@ -420,7 +420,7 @@ class GANSuperResolution:
             
             return tf.layers.conv2d(
                 x, 12,
-                [4, 4], [2, 2], 'same', name = 'conv3x3_3'
+                [4, 4], [2, 2], 'same', name = 'conv3x3_4'
             )
     
     def decode(self, x):
@@ -493,7 +493,7 @@ class GANSuperResolution:
             x = large_images[:, :, :, :3]
 
             x = tf.nn.selu(tf.layers.conv2d(
-                x, 16,
+                x, 64,
                 [3, 3], [1, 1], 'valid', name = 'conv3x3_1'
             ))
             
@@ -510,19 +510,19 @@ class GANSuperResolution:
             #x = tf.layers.average_pooling2d(x, 2, 2)
             
             x = tf.nn.selu(tf.layers.conv2d(
-                x, 16,
+                x, 64,
                 [4, 4], [2, 2], 'valid', name = 'conv4x4_2.2'
             ))
             
             x = tf.concat([x, small_images[:, 1:-1, 1:-1, :]], -1)
             
             x = tf.nn.selu(tf.layers.conv2d(
-                x, 16,
+                x, 64,
                 [3, 3], [1, 1], 'valid', name = 'conv3x3_3'
             ))
             
             #x = tf.nn.selu(tf.layers.conv2d(
-            #    x, 32,
+            #    x, 64,
             #    [3, 3], [1, 1], 'valid', name = 'conv3x3_4'
             #))
             
@@ -541,16 +541,12 @@ class GANSuperResolution:
         while True:
             while True:
                 try:
-                    real, downscaled, scaled, visualisation, \
+                    real, scaled, reconstructed, \
                     g_loss, d_loss, distance, summary = \
                         self.session.run([
-                            self.real[:8, :, :, :],
-                            self.downscaled[:8, :, :, :],
-                            #self.tampered[:4, :, :, :],
-                            #self.cleaned[:4, :, :, :],
-                            self.scaled[:8, :, :, :],
-                            self.reconstructed[:8, :, :, :],
-                            #self.visualisation[:8, :, :, :],
+                            self.real[:4, :, :, :],
+                            self.scaled[:4, :, :, :],
+                            self.reconstructed[:4, :, :, :],
                             self.g_loss, self.d_loss, 
                             self.distance,
                             self.summary
@@ -569,14 +565,9 @@ class GANSuperResolution:
 
             i = np.concatenate(
                 (
-                    real[:4, :, :, :], 
-                    #tampered, 
-                    #cleaned, 
-                    scaled[:4, :, :, :],
-                    visualisation[:4, :, :, :],
-                    real[4:, :, :, :],
-                    scaled[4:, :, :, :],
-                    visualisation[4:, :, :, :],
+                    real[:, :, :, :],
+                    scaled[:, :, :, :],
+                    reconstructed[:, :, :, :],
                 ),
                 axis = 2
             )
