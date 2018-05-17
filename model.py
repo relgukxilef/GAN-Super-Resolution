@@ -163,105 +163,42 @@ class GANSuperResolution:
         self.scaled_distribution = self.postprocess(scaled_distribution)
         self.reconstructed = self.postprocess(reconstructed)
         
-        blurred = self.xyz2ulab(self.lanczos3_upscale(downscaled_xyz))
-        
         # losses
-        fake_logits = tf.concat(
-            [
-                self.discriminate(scaled_distribution, downscaled)
-            ], 0
-        )
-        real_logits = self.discriminate(real, downscaled)
+        def square(x):
+            return tf.maximum(tf.square(x), 1e-5)
         
-        def norm(x):
-            return tf.sqrt(tf.reduce_sum(tf.square(x), axis = [1, 2, 3]) + 1e-8)
-            
-        def difference(real, fake):
-            #return tf.reduce_mean(tf.norm(
-            #    tf.abs(real - fake) * 
-            #    self.lab_scale / tf.reduce_mean(self.lab_scale) + 1e-8, 
-            #    axis = -1
-            #))
-            return tf.reduce_mean(
-                tf.abs(real - fake) * 
-                self.lab_scale / tf.reduce_mean(self.lab_scale)
-            )
-            
         def divergence(mean, deviation):
             # from
             # https://github.com/shaohua0116/VAE-Tensorflow/blob/master/demo.py
+            variance = square(deviation)
             return tf.reduce_mean(
                 0.5 * tf.reduce_sum(
-                    tf.square(mean) +
-                    tf.square(deviation) -
-                    tf.log(1e-6 + tf.square(deviation)) - 1,
+                    square(mean) +
+                    variance -
+                    tf.log(variance) - 1,
                     3
                 )
             )
-        
-        self.distance = (
-            tf.reduce_mean(fake_logits) - tf.reduce_mean(real_logits)
-        )
         
         divergence_loss = divergence(encoded_mean, encoded_deviation)
         self.divergence_loss = divergence_loss
         
         self.g_loss = sum([
-            2e-3 * tf.maximum(divergence_loss, 0.01),
-            1e-0 * difference(real, reconstructed)
+            1e-2 * tf.maximum(divergence_loss, 1e-2),
+            1e-0 * tf.reduce_mean(square(
+                (real - reconstructed) * 
+                self.lab_scale / tf.reduce_mean(self.lab_scale)
+            ))
         ])
         
-        variables = tf.trainable_variables()
-        g_variables = [v for v in variables if 'discriminate' not in v.name]
-        d_variables = [v for v in variables if 'discriminate' in v.name]
-        
-        print(
-            "g_variables:", len(g_variables), "d_variables:", len(d_variables)
-        )
-        print(g_variables)
-        
         self.g_optimizer = tf.train.AdamOptimizer(
-            self.learning_rate#, beta1 = 0.5#, beta2 = 0.9
-        ).minimize(
-            self.g_loss, self.global_step, var_list = g_variables
-        )
+            self.learning_rate
+        ).minimize(self.g_loss, self.global_step)
 
-        #self.d_optimizer = tf.train.AdamOptimizer(
-        #    self.learning_rate, beta1 = 0.5#, beta2 = 0.9#, epsilon = 1e-1
-        #).minimize(
-        #    self.d_loss, var_list = d_variables
-        #)
-        
-        
-        real_gradients = tf.norm(
-            tf.gradients(real_logits, real)[0], axis = -1
-        )
-        fake_gradients = tf.norm(
-            tf.gradients(fake_logits, scaled_distribution)[0], axis = -1
-        )
-        visualisation = tf.stack([real_gradients, fake_gradients], -1)
-        visualisation /= tf.reduce_mean(visualisation) * 4
-        visualisation = tf.concat([
-            visualisation,
-            tf.stack([
-                tf.zeros_like(real_gradients), 
-                tf.ones_like(real_gradients)
-            ], -1)
-        ], -1)
-        self.visualisation = tf.cast(tf.minimum(tf.maximum(
-            visualisation * 255, 0
-        ), 255), tf.int32)
-        
 
         self.saver = tf.train.Saver(max_to_keep = 2)
         
         tf.summary.scalar('generator loss', self.g_loss)
-        #tf.summary.scalar('discriminator loss', self.d_loss)
-        tf.summary.scalar('distance', self.distance)
-        tf.summary.histogram('fake score', fake_logits)
-        tf.summary.histogram('real score', real_logits)
-        
-        #tf.summary.image('kernels', kernel_grid)
         
         self.summary_writer = tf.summary.FileWriter('logs', self.session.graph)
         self.summary = tf.summary.merge_all()
@@ -481,60 +418,6 @@ class GANSuperResolution:
             )
             
             return x
-            
-    def discriminate(self, large_images, small_images):
-        with tf.variable_scope(
-            'discriminate', reuse = tf.AUTO_REUSE
-        ):
-            large_images *= self.lab_scale / tf.reduce_mean(self.lab_scale)
-            small_images *= self.lab_scale / tf.reduce_mean(self.lab_scale)
-            
-            # cut away alpha
-            small_images = small_images[:, :, :, :3]
-            x = large_images[:, :, :, :3]
-
-            x = tf.nn.selu(tf.layers.conv2d(
-                x, 16,
-                [3, 3], [1, 1], 'valid', name = 'conv3x3_1'
-            ))
-            
-            #x = tf.nn.selu(tf.layers.conv2d(
-            #    x, 16,
-            #    [3, 3], [1, 1], 'valid', name = 'conv3x3_2'
-            #))
-            
-            #x = tf.nn.selu(tf.layers.conv2d(
-            #    x, 16,
-            #    [3, 3], [1, 1], 'valid', name = 'conv3x3_2.1'
-            #))
-            
-            #x = tf.layers.average_pooling2d(x, 2, 2)
-            
-            x = tf.nn.selu(tf.layers.conv2d(
-                x, 16,
-                [4, 4], [2, 2], 'valid', name = 'conv4x4_2.2'
-            ))
-            
-            x = tf.concat([x, small_images[:, 1:-1, 1:-1, :]], -1)
-            
-            x = tf.nn.selu(tf.layers.conv2d(
-                x, 16,
-                [3, 3], [1, 1], 'valid', name = 'conv3x3_3'
-            ))
-            
-            #x = tf.nn.selu(tf.layers.conv2d(
-            #    x, 32,
-            #    [3, 3], [1, 1], 'valid', name = 'conv3x3_4'
-            #))
-            
-            x = tf.layers.conv2d(
-                x, 1,
-                [3, 3], [1, 1], 'valid', name = 'conv3x3_4'
-            )
-            
-            x = tf.reduce_mean(x, [1, 2], True)# * self.size
-            
-            return x
  
     def train(self):
         step = self.session.run(self.global_step)
@@ -544,18 +427,14 @@ class GANSuperResolution:
                 try:
                     real, downscaled, scaled_distribution, scaled, \
                     reconstructed, \
-                    g_loss, divergence_loss, distance, summary = \
+                    g_loss, divergence_loss, summary = \
                         self.session.run([
                             self.real[:8, :, :, :],
                             self.downscaled[:8, :, :, :],
-                            #self.tampered[:4, :, :, :],
-                            #self.cleaned[:4, :, :, :],
                             self.scaled_distribution[:8, :, :, :],
                             self.scaled[:8, :, :, :],
                             self.reconstructed[:8, :, :, :],
-                            #self.visualisation[:8, :, :, :],
                             self.g_loss, self.divergence_loss,
-                            self.distance,
                             self.summary
                         ])
                     break
