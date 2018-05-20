@@ -10,7 +10,7 @@ from tqdm import tqdm
 class GANSuperResolution:
     def __init__(
         self, session, continue_train = True, 
-        learning_rate = 2.5e-4, batch_size = 4
+        learning_rate = 5e-5, batch_size = 4
     ):
         self.session = session
         self.learning_rate = learning_rate
@@ -147,13 +147,15 @@ class GANSuperResolution:
         encoded = self.encode(real)
         reconstructed = self.scale(downscaled, encoded)
         
-        #cleaned = self.denoise(tampered)
+        encoded_distribution = tf.random_normal(tf.shape(encoded))
         scaled_distribution = self.scale(
-            downscaled, tf.random_normal(tf.shape(encoded))
+            downscaled, encoded_distribution
         )
         scaled = self.scale(
             downscaled, tf.zeros_like(encoded)
         )
+        
+        encoded_reconstruction = self.encode(scaled_distribution)
         
         #self.cleaned = self.postprocess(cleaned)
         self.scaled = self.postprocess(scaled)
@@ -170,22 +172,19 @@ class GANSuperResolution:
         )
         real_logits = self.discriminate(real, downscaled)
         
+        def norm_squared(x):
+            return tf.reduce_sum(
+                tf.maximum(tf.square(x), 1e-5), axis = -1
+            )
+        
         def norm(x):
-            return tf.sqrt(tf.reduce_sum(tf.square(x), axis = [1, 2, 3]) + 1e-8)
+            return tf.sqrt(norm_squared(x))
             
         def difference(real, fake):
-            #return tf.reduce_mean(tf.norm(
-            #    tf.abs(real - fake) * 
-            #    self.lab_scale / tf.reduce_mean(self.lab_scale) + 1e-8, 
-            #    axis = -1
-            #))
             return tf.reduce_mean(
                 tf.abs(real - fake) * 
                 self.lab_scale / tf.reduce_mean(self.lab_scale)
             )
-            
-        def log(x):
-            return tf.log(x + 1e-8)
         
         self.distance = (
             tf.reduce_mean(fake_logits) - tf.reduce_mean(real_logits)
@@ -195,16 +194,18 @@ class GANSuperResolution:
             1e-2 * tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
                 logits = fake_logits, labels = tf.ones_like(fake_logits)
             )), # non-saturating GAN
-            1e-0 * difference(real, reconstructed)
+            1e-0 * difference(real, reconstructed),
+            #1e-0 * tf.reduce_mean(
+            #    tf.abs(encoded_distribution - encoded_reconstruction)
+            #),
         ])
         self.d_loss = sum([
-            1e-0 * tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
+            tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
                 logits = real_logits, labels = tf.ones_like(real_logits)
             )),
-            1e-0 * tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
+            tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
                 logits = fake_logits, labels = tf.zeros_like(fake_logits)
             )), 
-            #1e0 * penalty,
         ])
         
         # lsgan
@@ -266,8 +267,6 @@ class GANSuperResolution:
         tf.summary.scalar('distance', self.distance)
         tf.summary.histogram('fake score', fake_logits)
         tf.summary.histogram('real score', real_logits)
-        
-        #tf.summary.image('kernels', kernel_grid)
         
         self.summary_writer = tf.summary.FileWriter('logs', self.session.graph)
         self.summary = tf.summary.merge_all()
@@ -410,17 +409,22 @@ class GANSuperResolution:
         ):
             x = tf.nn.selu(tf.layers.conv2d(
                 x, 16,
-                [3, 3], [1, 1], 'same', name = 'conv3x3_1'
+                [4, 4], [2, 2], 'same', name = '1'
             ))
             
             x = tf.nn.selu(tf.layers.conv2d(
                 x, 32,
-                [3, 3], [1, 1], 'same', name = 'conv3x3_2'
+                [3, 3], [1, 1], 'same', name = '2'
+            ))
+            
+            x = tf.nn.selu(tf.layers.conv2d(
+                x, 32,
+                [3, 3], [1, 1], 'same', name = '3'
             ))
             
             return tf.layers.conv2d(
                 x, 12,
-                [4, 4], [2, 2], 'same', name = 'conv3x3_4'
+                [3, 3], [1, 1], 'same', name = '4'
             )
     
     def decode(self, x):
@@ -447,15 +451,15 @@ class GANSuperResolution:
                 [3, 3], [1, 1], 'same', name = 'conv3x3_4'
             ))
             
-            #x = tf.nn.selu(tf.layers.conv2d(
-            #    x, 128,
-            #    [3, 3], [1, 1], 'same', name = 'conv3x3_5'
-            #))
-            
             x = tf.nn.selu(tf.layers.conv2d(
-                x, 256,
-                [3, 3], [1, 1], 'same', name = 'conv3x3_6'
+                x, 128,
+                [3, 3], [1, 1], 'same', name = 'conv3x3_5'
             ))
+            
+            #x = tf.nn.selu(tf.layers.conv2d(
+            #    x, 256,
+            #    [3, 3], [1, 1], 'same', name = 'conv3x3_6'
+            #))
             
             x = tf.layers.conv2d_transpose(
                 x, 3, [4, 4], [2, 2], 'same', name = 'deconv4x4'
@@ -494,44 +498,32 @@ class GANSuperResolution:
 
             x = tf.nn.selu(tf.layers.conv2d(
                 x, 64,
-                [3, 3], [1, 1], 'valid', name = 'conv3x3_1'
+                [4, 4], [2, 2], 'same', name = '1'
             ))
             
-            #x = tf.nn.selu(tf.layers.conv2d(
-            #    x, 16,
-            #    [3, 3], [1, 1], 'valid', name = 'conv3x3_2'
-            #))
-            
-            #x = tf.nn.selu(tf.layers.conv2d(
-            #    x, 16,
-            #    [3, 3], [1, 1], 'valid', name = 'conv3x3_2.1'
-            #))
-            
-            #x = tf.layers.average_pooling2d(x, 2, 2)
+            x = tf.concat([x, small_images], -1)
             
             x = tf.nn.selu(tf.layers.conv2d(
-                x, 64,
-                [4, 4], [2, 2], 'valid', name = 'conv4x4_2.2'
+                x, 128,
+                [3, 3], [1, 1], 'valid', name = '2'
             ))
-            
-            x = tf.concat([x, small_images[:, 1:-1, 1:-1, :]], -1)
             
             x = tf.nn.selu(tf.layers.conv2d(
-                x, 64,
-                [3, 3], [1, 1], 'valid', name = 'conv3x3_3'
+                x, 128,
+                [3, 3], [1, 1], 'valid', name = '3'
             ))
             
-            #x = tf.nn.selu(tf.layers.conv2d(
-            #    x, 64,
-            #    [3, 3], [1, 1], 'valid', name = 'conv3x3_4'
-            #))
+            x = tf.nn.selu(tf.layers.conv2d(
+                x, 128,
+                [3, 3], [1, 1], 'valid', name = '4'
+            ))
             
             x = tf.layers.conv2d(
                 x, 1,
-                [3, 3], [1, 1], 'valid', name = 'conv3x3_4'
+                [3, 3], [1, 1], 'valid', name = '5'
             )
             
-            x = tf.reduce_mean(x, [1, 2], True)# * self.size
+            x = tf.reduce_mean(x, [1, 2], True)
             
             return x
  
@@ -541,11 +533,11 @@ class GANSuperResolution:
         while True:
             while True:
                 try:
-                    real, scaled, reconstructed, \
+                    real, scaled_distribution, reconstructed, \
                     g_loss, d_loss, distance, summary = \
                         self.session.run([
                             self.real[:4, :, :, :],
-                            self.scaled[:4, :, :, :],
+                            self.scaled_distribution[:4, :, :, :],
                             self.reconstructed[:4, :, :, :],
                             self.g_loss, self.d_loss, 
                             self.distance,
@@ -566,7 +558,7 @@ class GANSuperResolution:
             i = np.concatenate(
                 (
                     real[:, :, :, :],
-                    scaled[:, :, :, :],
+                    scaled_distribution[:, :, :, :],
                     reconstructed[:, :, :, :],
                 ),
                 axis = 2
