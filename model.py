@@ -10,7 +10,7 @@ from tqdm import tqdm
 class GANSuperResolution:
     def __init__(
         self, session, continue_train = True, 
-        learning_rate = 2.5e-4, batch_size = 8
+        learning_rate = 2.5e-4, batch_size = 4
     ):
         self.session = session
         self.learning_rate = learning_rate
@@ -107,8 +107,8 @@ class GANSuperResolution:
         
         d = tf.data.Dataset.from_tensor_slices(tf.constant(self.paths))
         d = d.shuffle(100000).repeat()
-        d = d.flat_map(load).shuffle(1000)
-        d = d.batch(self.batch_size).prefetch(10)
+        d = d.flat_map(load).shuffle(500)
+        d = d.batch(self.batch_size).prefetch(2 * 4)
         
         
         iterator = d.make_one_shot_iterator()
@@ -171,21 +171,21 @@ class GANSuperResolution:
             # from
             # https://github.com/shaohua0116/VAE-Tensorflow/blob/master/demo.py
             variance = square(deviation)
-            return tf.reduce_mean(
-                0.5 * tf.reduce_sum(
-                    square(mean) +
-                    variance -
-                    tf.log(variance) - 1,
-                    3
-                )
+            return 0.5 * tf.reduce_sum(
+                square(mean) +
+                variance -
+                tf.log(variance) - 1,
+                3, True
             )
         
-        divergence_loss = divergence(encoded_mean, encoded_deviation)
+        divergence_loss = tf.reduce_mean(
+            divergence(encoded_mean, encoded_deviation)
+        )
         self.divergence_loss = divergence_loss
         
         self.g_loss = sum([
-            1e-2 * tf.maximum(divergence_loss, 1e-2),
-            1e-0 * tf.reduce_mean(square(
+            1e-2 * tf.maximum(divergence_loss, 1e-3),
+            1e-0 * tf.reduce_mean(tf.abs(
                 (real - reconstructed) * 
                 self.lab_scale / tf.reduce_mean(self.lab_scale)
             ))
@@ -194,7 +194,17 @@ class GANSuperResolution:
         self.g_optimizer = tf.train.AdamOptimizer(
             self.learning_rate
         ).minimize(self.g_loss, self.global_step)
-
+        
+        
+        self.information = tf.cast(tf.minimum(tf.maximum(
+            tf.pad(tf.tile(
+                tf.image.resize_nearest_neighbor(
+                    1 - 2**-divergence(encoded_mean, encoded_deviation),
+                    [128, 128]
+                ), [1, 1, 1, 3]
+            ), [[0, 0], [0, 0], [0, 0], [0, 1]], constant_values = 1) * 255, 0
+        ), 255), tf.int32)
+        
 
         self.saver = tf.train.Saver(max_to_keep = 2)
         
@@ -341,24 +351,30 @@ class GANSuperResolution:
         ):
             x = tf.nn.selu(tf.layers.conv2d(
                 x, 16,
-                [3, 3], [1, 1], 'same', name = 'conv3x3_1'
+                [4, 4], [2, 2], 'same', name = '1'
             ))
             
             x = tf.nn.selu(tf.layers.conv2d(
                 x, 32,
-                [3, 3], [1, 1], 'same', name = 'conv3x3_2'
+                [3, 3], [1, 1], 'same', name = '2'
             ))
             
             x = tf.nn.selu(tf.layers.conv2d(
-                x, 32,
-                [3, 3], [1, 1], 'same', name = 'conv3x3_3'
+                x, 64,
+                [3, 3], [1, 1], 'same', name = '3'
             ))
+            
+            #x = tf.nn.selu(tf.layers.conv2d(
+            #    x, 128,
+            #    [3, 3], [1, 1], 'same', name = '4'
+            #))
             
             final = tf.layers.conv2d(
                 x, 12 * 2,
-                [4, 4], [2, 2], 'same', name = 'conv3x3_4'
+                [3, 3], [1, 1], 'same', name = '5'
             )
             
+            # TODO: try without softplus
             return final[:, :, :, :12], tf.nn.softplus(final[:, :, :, 12:])
     
     def decode(self, x):
@@ -425,15 +441,15 @@ class GANSuperResolution:
         while True:
             while True:
                 try:
-                    real, downscaled, scaled_distribution, scaled, \
+                    real, downscaled, information, scaled, \
                     reconstructed, \
                     g_loss, divergence_loss, summary = \
                         self.session.run([
-                            self.real[:8, :, :, :],
-                            self.downscaled[:8, :, :, :],
-                            self.scaled_distribution[:8, :, :, :],
-                            self.scaled[:8, :, :, :],
-                            self.reconstructed[:8, :, :, :],
+                            self.real[:4, :, :, :],
+                            self.downscaled[:4, :, :, :],
+                            self.information[:4, :, :, :],
+                            self.scaled[:4, :, :, :],
+                            self.reconstructed[:4, :, :, :],
                             self.g_loss, self.divergence_loss,
                             self.summary
                         ])
@@ -446,20 +462,18 @@ class GANSuperResolution:
                     "#{}, g_loss: {:.4f}, divergence: {:.4f}"
                 ).format(step, g_loss, divergence_loss)
             )
-            
-            #real[:, :self.size // 2, :self.size // 2, :] = downscaled
 
             i = np.concatenate(
                 (
                     real[:4, :, :, :], 
                     scaled[:4, :, :, :],
-                    scaled_distribution[:4, :, :, :],
                     reconstructed[:4, :, :, :],
+                    information[:4, :, :, :],
                     
-                    real[4:, :, :, :],
-                    scaled[4:, :, :, :],
-                    scaled_distribution[4:, :, :, :],
-                    reconstructed[4:, :, :, :],
+                    #real[4:, :, :, :],
+                    #scaled[4:, :, :, :],
+                    #scaled_distribution[4:, :, :, :],
+                    #reconstructed[4:, :, :, :],
                 ),
                 axis = 2
             )
@@ -483,7 +497,6 @@ class GANSuperResolution:
                     try:
                         _, step = self.session.run([
                             [
-                                #self.d_optimizer, 
                                 self.g_optimizer
                             ],
                             self.global_step
