@@ -10,7 +10,7 @@ from tqdm import tqdm
 class GANSuperResolution:
     def __init__(
         self, session, continue_train = True, 
-        learning_rate = 2.5e-4, batch_size = 4
+        learning_rate = 2e-3, batch_size = 2
     ):
         self.session = session
         self.learning_rate = learning_rate
@@ -40,7 +40,7 @@ class GANSuperResolution:
             image = tf.image.decode_image(tf.read_file(path), 4)
             return tf.data.Dataset.from_tensor_slices([
                 tf.random_crop(image, [self.size, self.size, 4])
-                for _ in range(10)
+                for _ in range(20)
             ])
             #return tf.data.Dataset.from_tensor_slices(
             #    tf.reshape(
@@ -107,8 +107,8 @@ class GANSuperResolution:
         
         d = tf.data.Dataset.from_tensor_slices(tf.constant(self.paths))
         d = d.shuffle(100000).repeat()
-        d = d.flat_map(load).shuffle(500)
-        d = d.batch(self.batch_size).prefetch(2 * 4)
+        d = d.flat_map(load).shuffle(1000)
+        d = d.batch(self.batch_size).prefetch(32)
         
         
         iterator = d.make_one_shot_iterator()
@@ -165,7 +165,7 @@ class GANSuperResolution:
         
         # losses
         def square(x):
-            return tf.maximum(tf.square(x), 1e-5)
+            return tf.square(tf.abs(x) + 5e-3)
         
         def divergence(mean, deviation):
             # from
@@ -174,7 +174,7 @@ class GANSuperResolution:
             return 0.5 * tf.reduce_sum(
                 square(mean) +
                 variance -
-                tf.log(variance) - 1,
+                tf.log(variance) - 1, 
                 3, True
             )
         
@@ -184,16 +184,32 @@ class GANSuperResolution:
         self.divergence_loss = divergence_loss
         
         self.g_loss = sum([
-            1e-2 * tf.maximum(divergence_loss, 1e-3),
-            1e-0 * tf.reduce_mean(tf.abs(
+            1e-3 * divergence_loss,
+            1e-0 * tf.reduce_mean(square(
                 (real - reconstructed) * 
                 self.lab_scale / tf.reduce_mean(self.lab_scale)
             ))
         ])
         
-        self.g_optimizer = tf.train.AdamOptimizer(
-            self.learning_rate
-        ).minimize(self.g_loss, self.global_step)
+        optimizer = tf.train.MomentumOptimizer(
+            tf.train.exponential_decay(
+                self.learning_rate, self.global_step, 100000, 0.5
+            ),
+            0.9
+        )
+        
+        self.g_optimizer = optimizer.minimize(self.g_loss, self.global_step)
+        
+        
+        exponentialAverages = tf.train.ExponentialMovingAverage(0.995)
+        
+        with tf.control_dependencies([self.g_optimizer]):
+            self.g_optimizer = exponentialAverages.apply([
+                self.g_loss, self.divergence_loss
+            ])
+            
+        self.g_loss = exponentialAverages.average(self.g_loss)
+        self.divergence_loss = exponentialAverages.average(self.divergence_loss)
         
         
         self.information = tf.cast(tf.minimum(tf.maximum(
@@ -364,18 +380,26 @@ class GANSuperResolution:
                 [3, 3], [1, 1], 'same', name = '3'
             ))
             
-            #x = tf.nn.selu(tf.layers.conv2d(
-            #    x, 128,
-            #    [3, 3], [1, 1], 'same', name = '4'
-            #))
+            x = tf.nn.selu(tf.layers.conv2d(
+                x, 128,
+                [3, 3], [1, 1], 'same', name = '4'
+            ))
+            
+            x = tf.nn.selu(tf.layers.conv2d(
+                x, 256,
+                [3, 3], [1, 1], 'same', name = '5'
+            ))
             
             final = tf.layers.conv2d(
-                x, 12 * 2,
-                [3, 3], [1, 1], 'same', name = '5'
+                x, 9 * 2,
+                [3, 3], [1, 1], 'same', name = 'final'
             )
             
-            # TODO: try without softplus
-            return final[:, :, :, :12], tf.nn.softplus(final[:, :, :, 12:])
+            mean = final[:, :, :, :9]
+            deviation = tf.nn.softplus(final[:, :, :, 9:])
+            # note: exp is unstable
+            
+            return mean, deviation
     
     def decode(self, x):
         with tf.variable_scope(
@@ -445,11 +469,11 @@ class GANSuperResolution:
                     reconstructed, \
                     g_loss, divergence_loss, summary = \
                         self.session.run([
-                            self.real[:4, :, :, :],
-                            self.downscaled[:4, :, :, :],
-                            self.information[:4, :, :, :],
-                            self.scaled[:4, :, :, :],
-                            self.reconstructed[:4, :, :, :],
+                            self.real,
+                            self.downscaled,
+                            self.information,
+                            self.scaled_distribution,
+                            self.reconstructed,
                             self.g_loss, self.divergence_loss,
                             self.summary
                         ])
@@ -465,10 +489,7 @@ class GANSuperResolution:
 
             i = np.concatenate(
                 (
-                    real[:4, :, :, :], 
-                    scaled[:4, :, :, :],
-                    reconstructed[:4, :, :, :],
-                    information[:4, :, :, :],
+                    real, scaled, reconstructed, information,
                     
                     #real[4:, :, :, :],
                     #scaled[4:, :, :, :],
@@ -497,7 +518,7 @@ class GANSuperResolution:
                     try:
                         _, step = self.session.run([
                             [
-                                self.g_optimizer
+                                self.g_optimizer,
                             ],
                             self.global_step
                         ])
