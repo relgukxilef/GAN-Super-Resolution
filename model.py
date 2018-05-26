@@ -10,7 +10,7 @@ from tqdm import tqdm
 class GANSuperResolution:
     def __init__(
         self, session, continue_train = True, 
-        learning_rate = 5e-5, batch_size = 4
+        learning_rate = 1e-4, batch_size = 2
     ):
         self.session = session
         self.learning_rate = learning_rate
@@ -165,11 +165,7 @@ class GANSuperResolution:
         blurred = self.xyz2ulab(self.lanczos3_upscale(downscaled_xyz))
         
         # losses
-        fake_logits = tf.concat(
-            [
-                self.discriminate(scaled_distribution, downscaled)
-            ], 0
-        )
+        fake_logits = self.discriminate(scaled_distribution, downscaled)
         real_logits = self.discriminate(real, downscaled)
         
         def norm_squared(x):
@@ -191,10 +187,10 @@ class GANSuperResolution:
         )
         
         self.g_loss = sum([
-            1e-2 * tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
+            tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
                 logits = fake_logits, labels = tf.ones_like(fake_logits)
             )), # non-saturating GAN
-            1e-0 * difference(real, reconstructed),
+            difference(real, reconstructed),
             #1e-0 * tf.reduce_mean(
             #    tf.abs(encoded_distribution - encoded_reconstruction)
             #),
@@ -418,13 +414,23 @@ class GANSuperResolution:
             ))
             
             x = tf.nn.selu(tf.layers.conv2d(
-                x, 32,
+                x, 64,
                 [3, 3], [1, 1], 'same', name = '3'
             ))
             
-            return tf.layers.conv2d(
-                x, 12,
+            x = tf.nn.selu(tf.layers.conv2d(
+                x, 128,
                 [3, 3], [1, 1], 'same', name = '4'
+            ))
+            
+            x = tf.nn.selu(tf.layers.conv2d(
+                x, 256,
+                [3, 3], [1, 1], 'same', name = '6'
+            ))
+            
+            return tf.layers.conv2d(
+                x, 9,
+                [3, 3], [1, 1], 'same', name = 'final'
             )
     
     def decode(self, x):
@@ -433,47 +439,44 @@ class GANSuperResolution:
         ):
             x = tf.nn.selu(tf.layers.conv2d(
                 x, 16,
-                [3, 3], [1, 1], 'same', name = 'conv3x3_1'
+                [3, 3], [1, 1], 'same', name = '1'
             ))
             
             x = tf.nn.selu(tf.layers.conv2d(
                 x, 32,
-                [3, 3], [1, 1], 'same', name = 'conv3x3_2'
+                [3, 3], [1, 1], 'same', name = '2'
             ))
             
             x = tf.nn.selu(tf.layers.conv2d(
                 x, 64,
-                [3, 3], [1, 1], 'same', name = 'conv3x3_3'
+                [3, 3], [1, 1], 'same', name = '3'
             ))
             
             x = tf.nn.selu(tf.layers.conv2d(
                 x, 128,
-                [3, 3], [1, 1], 'same', name = 'conv3x3_4'
-            ))
-            
-            x = tf.nn.selu(tf.layers.conv2d(
-                x, 128,
-                [3, 3], [1, 1], 'same', name = 'conv3x3_5'
+                [3, 3], [1, 1], 'same', name = '4'
             ))
             
             #x = tf.nn.selu(tf.layers.conv2d(
-            #    x, 256,
-            #    [3, 3], [1, 1], 'same', name = 'conv3x3_6'
+            #    x, 128,
+            #    [3, 3], [1, 1], 'same', name = '5'
             #))
             
+            x = tf.nn.selu(tf.layers.conv2d(
+                x, 256,
+                [3, 3], [1, 1], 'same', name = '6'
+            ))
+            
             x = tf.layers.conv2d_transpose(
-                x, 3, [4, 4], [2, 2], 'same', name = 'deconv4x4'
+                x, 3, [4, 4], [2, 2], 'same', name = 'final'
             )
             
             return x
             
-    def scale(self, images, noise = None):
+    def scale(self, images, noise):
         with tf.variable_scope(
             'scale', reuse = tf.AUTO_REUSE
         ):
-            if noise is None:
-                noise = tf.zeros(tf.concat([tf.shape(images)[0:2], [12]], 0))
-        
             x = tf.concat([images, noise], -1)
             
             x = self.decode(x)
@@ -497,19 +500,19 @@ class GANSuperResolution:
             x = large_images[:, :, :, :3]
 
             x = tf.nn.selu(tf.layers.conv2d(
-                x, 64,
+                x, 16,
                 [4, 4], [2, 2], 'same', name = '1'
             ))
             
             x = tf.concat([x, small_images], -1)
             
             x = tf.nn.selu(tf.layers.conv2d(
-                x, 128,
+                x, 32,
                 [3, 3], [1, 1], 'valid', name = '2'
             ))
             
             x = tf.nn.selu(tf.layers.conv2d(
-                x, 128,
+                x, 64,
                 [3, 3], [1, 1], 'valid', name = '3'
             ))
             
@@ -523,7 +526,7 @@ class GANSuperResolution:
                 [3, 3], [1, 1], 'valid', name = '5'
             )
             
-            x = tf.reduce_mean(x, [1, 2], True)
+            #x = tf.reduce_mean(x, [1, 2], True)
             
             return x
  
