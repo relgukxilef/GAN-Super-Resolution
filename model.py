@@ -20,14 +20,15 @@ def nice_power(x, n, s, e):
         tf.where(
             x > e,
             ea * x + eb,
-            x**n
+            tf.maximum(tf.minimum(x, e), s)**n
         )
     )
 
 class GANSuperResolution:
     def __init__(
         self, session, continue_train = True, 
-        learning_rate = 1e-4, batch_size = 1
+        learning_rate = 1e-4, # explosions at 5e-5
+        batch_size = 4
     ):
         self.session = session
         self.learning_rate = learning_rate
@@ -37,16 +38,8 @@ class GANSuperResolution:
         self.max_filters = 128
         self.dimensions = 32
         self.checkpoint_path = "checkpoints"
-        self.size = 128
+        self.size = 64
         
-        # values calculated from 1200 random training tiles
-        self.lab_shift = tf.constant(
-            [[[[58.190086, 22.409063, -4.994123, 0]]]]
-        )
-        self.lab_scale = tf.constant(
-            [[[[34.140823, 83.433235, 31.84137, 1]]]]
-        )
-
         self.global_step = tf.Variable(0, name = 'global_step')
 
         # build model
@@ -57,7 +50,7 @@ class GANSuperResolution:
             image = tf.image.decode_image(tf.read_file(path), 4)
             return tf.data.Dataset.from_tensor_slices([
                 tf.random_crop(image, [self.size, self.size, 4])
-                for _ in range(10)
+                for _ in range(20)
             ])
             #return tf.data.Dataset.from_tensor_slices(
             #    tf.reshape(
@@ -124,7 +117,7 @@ class GANSuperResolution:
         
         d = tf.data.Dataset.from_tensor_slices(tf.constant(self.paths))
         d = d.shuffle(100000).repeat()
-        d = d.flat_map(load).shuffle(1000)
+        d = d.flat_map(load).shuffle(2000)
         d = d.batch(self.batch_size).prefetch(16)
         
         
@@ -147,98 +140,75 @@ class GANSuperResolution:
             )),
             tf.reduce_mean(tf.abs(
                 tf.to_float(self.srgb2xyz(self.real)) -
-                tf.to_float(self.ulab2xyz(self.preprocess(self.real)))
+                tf.to_float(self.lab2xyz(self.preprocess(self.real)))
             ))
         ])
         print(moments, "error:", error1, error2)
         #return
         
-        real_xyz = self.srgb2xyz(self.real)
-        real = self.xyz2ulab(real_xyz)
+        real = self.srgb2xyz(self.real)
         #tampered = self.preprocess(self.tampered)
-        downscaled_xyz = self.lanczos3_downscale(real_xyz)
-        downscaled = self.xyz2ulab(downscaled_xyz)
+        downscaled = self.lanczos3_downscale(real)
         
-        self.downscaled = self.postprocess(downscaled)
+        self.downscaled = self.xyz2srgb(downscaled)
         
-        encoded = self.encode(real)
-        reconstructed = self.scale(downscaled, encoded)
+        scaled = self.scale(downscaled)
         
-        encoded_distribution = tf.random_normal(tf.shape(encoded))
-        scaled_distribution = self.scale(
-            downscaled, encoded_distribution
-        )
-        scaled = self.scale(
-            downscaled, tf.zeros_like(encoded)
-        )
+        #self.cleaned = self.xyz2srgb(cleaned)
+        self.scaled = self.xyz2srgb(scaled)
         
-        encoded_reconstruction = self.encode(scaled_distribution)
-        
-        #self.cleaned = self.postprocess(cleaned)
-        self.scaled = self.postprocess(scaled)
-        self.scaled_distribution = self.postprocess(scaled_distribution)
-        self.reconstructed = self.postprocess(reconstructed)
-        
-        redownscaled = self.xyz2ulab(
-            self.lanczos3_downscale(
-                self.ulab2xyz(scaled_distribution), "VALID"
-            )
-        )
-        redownscaled = self.xyz2ulab(
-            self.lanczos3_downscale(self.ulab2xyz(scaled_distribution), "VALID")
-        )
-        self.redownscaled = self.postprocess(redownscaled)
+        redownscaled = self.lanczos3_downscale(scaled, "VALID")
+        self.redownscaled = self.xyz2srgb(redownscaled)
         
         # losses
-        fake_logits = self.discriminate(scaled_distribution, downscaled)
-        real_logits = self.discriminate(real, downscaled)
+        fake_logits = self.discriminate(
+            scaled, downscaled
+            #self.xyz2lab(scaled), self.xyz2lab(downscaled)
+        )
+        real_logits = self.discriminate(
+            real, downscaled
+            #self.xyz2lab(real), self.xyz2lab(downscaled)
+        )
         
-        def norm_squared(x):
-            return tf.reduce_sum(
-                tf.maximum(tf.square(x), 1e-5), axis = -1
-            )
-        
-        def norm(x):
-            return tf.sqrt(norm_squared(x))
-            
-        def difference(real, fake):
-            return tf.reduce_mean(
-                tf.abs(real - fake) * 
-                self.lab_scale / tf.reduce_mean(self.lab_scale)
-            )
+        def visual_difference(real, fake):
+            return tf.reduce_mean((
+                #self.xyz2lab(real) - self.xyz2lab(fake)
+                nice_power(real, 1/3, 1e-2, 1) - nice_power(fake, 1/3, 1e-2, 1)
+            )**2)
         
         self.distance = (
             tf.reduce_mean(fake_logits) - tf.reduce_mean(real_logits)
         )
         
-        self.rescale_loss = difference(
-            self.xyz2ulab(self.lanczos3_downscale(real_xyz, "VALID")), 
+        self.rescale_loss = tf.reduce_mean((
+            self.lanczos3_downscale(real, "VALID") - 
             redownscaled
-        )
+        )**2)
         
-        median_loss = difference(scaled, real)
+        median_loss = tf.reduce_mean((real - scaled)**2)
+        #median_loss = visual_difference(real, scaled)
         
         self.g_loss = sum([
-            #tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
-            #    logits = fake_logits, labels = tf.ones_like(fake_logits)
-            #)), # non-saturating GAN
-            1e-2 * tf.reduce_mean(nice_power(fake_logits - 0.5, 2, -2, 2)),
-            median_loss, # approximate median
-            #self.rescale_loss,
-            difference(real, reconstructed),
-            #tf.reduce_mean(
-            #    tf.abs(encoded_distribution - encoded_reconstruction)
-            #),
+            1e-3 * tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
+                logits = fake_logits, labels = tf.ones_like(fake_logits)
+            )), # non-saturating GAN
+            #tf.minimum(1.0, tf.to_float(self.global_step) / 2e5) *
+            #tf.reduce_mean((fake_logits - 0.5)**2),
+            #2 * median_loss,
+            #2 * self.rescale_loss,
+            #2 * tf.reduce_mean(tf.abs(real - reconstructed)),
+            #tf.reduce_mean((encoded_distribution - encoded_reconstruction)**2),
+            tf.reduce_mean((real - scaled)**2)
         ])
         self.d_loss = sum([
-            #tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
-            #    logits = real_logits, labels = tf.ones_like(real_logits)
-            #)),
-            #tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
-            #    logits = fake_logits, labels = tf.zeros_like(fake_logits)
-            #)), 
-            tf.reduce_mean(nice_power(real_logits - 0.5, 2, -2, 2)),
-            tf.reduce_mean(nice_power(fake_logits + 0.5, 2, -2, 2)),
+            tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
+                logits = real_logits, labels = tf.ones_like(real_logits)
+            )),
+            tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
+                logits = fake_logits, labels = tf.zeros_like(fake_logits)
+            )), 
+            #tf.reduce_mean((real_logits - 0.5)**2),
+            #tf.reduce_mean((fake_logits + 0.5)**2),
         ])
         
         variables = tf.trainable_variables()
@@ -250,13 +220,14 @@ class GANSuperResolution:
         )
         
         self.g_optimizer = tf.train.AdamOptimizer(
-            learning_rate#, beta1 = 0.5#, beta2 = 0.9
+            learning_rate#, 0.5, 0.9#, use_nesterov = True#, beta1 = 0.5#, beta2 = 0.9
         ).minimize(
             self.g_loss, self.global_step, var_list = g_variables
         )
 
         self.d_optimizer = tf.train.AdamOptimizer(
-            learning_rate#, beta1 = 0.5#, beta2 = 0.9#, epsilon = 1e-1
+            learning_rate#, 0.5, 0.9#, use_nesterov = True#, beta1 = 0.5#, beta2 = 0.9
+            #epsilon = 1e-2
         ).minimize(
             self.d_loss, var_list = d_variables
         )
@@ -319,15 +290,21 @@ class GANSuperResolution:
             self.lanczos3_vertical, [1, 1, 2, 1], padding
         )
     def lanczos3_upscale(self, x):
-        return tf.nn.conv2d_transpose(
+        result = tf.nn.conv2d_transpose(
             tf.nn.conv2d_transpose(
                 x * 4,
-                self.lanczos3_horizontal, tf.shape(x) * [1, 2, 1, 1],
+                self.lanczos3_horizontal, 
+                tf.shape(x) * [1, 2, 1, 1],
                 [1, 2, 1, 1], "SAME"
             ), 
-            self.lanczos3_vertical, tf.shape(x) * [1, 2, 2, 1], 
+            self.lanczos3_vertical, 
+            tf.shape(x) * [1, 2, 2, 1], 
             [1, 1, 2, 1], "SAME"
         )
+        result.set_shape(
+            [x.shape[0], x.shape[1] * 2, x.shape[2] * 2, x.shape[3]]
+        )
+        return result
             
     def srgb2xyz(self, c):
         c = tf.cast(c, tf.float32) / 255
@@ -366,209 +343,138 @@ class GANSuperResolution:
             srgb * 255, 0
         ), 255), tf.int32)
         
-    def xyz2ulab(self, c):
+    def xyz2lab(self, c):
         xyz, alpha = tf.split(c, [3, 1], -1)
         # https://en.wikipedia.org/wiki/Lab_color_space
         def f(t):
-            #return t
             return nice_power(t, 1 / 3, 6**3 / 29**3, 1)
-            return tf.where(
-                t > 6**3 / 29**3, 
-                t**(1 / 3), 
-                t / (3 * 6**2 / 29**2) + 4 / 29
-            )
         x, y, z = (xyz[:, :, :, i] for i in range(3))
         x_n, y_n, z_n = 0.9505, 1.00, 1.089
         lab = tf.stack(
             [
-                116 * f(y / y_n) - 16,
-                500 * (f(x / x_n) - f(y / y_n)),
-                200 * (f(y / y_n) - f(z / z_n))
+                1.16 * f(y / y_n) - 0.16,
+                5.00 * (f(x / x_n) - f(y / y_n)),
+                2.00 * (f(y / y_n) - f(z / z_n))
             ],
             -1
         )
-        laba = tf.concat([lab, alpha], -1)
-        # normalize
-        return (laba - self.lab_shift) / self.lab_scale
+        return tf.concat([lab, alpha], -1)
 
-    def ulab2xyz(self, c):
+    def lab2xyz(self, c):
         # denormalize
-        c = c * self.lab_scale + self.lab_shift
         lab, alpha = tf.split(c, [3, 1], -1)
         
         # https://en.wikipedia.org/wiki/Lab_color_space
         def f(t):
-            #return t
             return nice_power(t, 3, 6 / 29, 1)
-            return tf.where(
-                t > 6 / 29,
-                t**3,
-                3 * 6**2 / 29**2 * (t - 4 / 29)
-            )
         l, a, b = (lab[:, :, :, i] for i in range(3))
         #l = tf.maximum(l, 0)
         x_n, y_n, z_n = 0.9505, 1.00, 1.089
-        l2 = (l + 16) / 116
+        l2 = (l + 0.16) / 1.16
         xyz = tf.stack([
-            x_n * f(l2 + a / 500),
+            x_n * f(l2 + a / 5.00),
             y_n * f(l2),
-            z_n * f(l2 - b / 200)
+            z_n * f(l2 - b / 2.00)
         ], -1)
         return tf.concat([xyz, alpha], -1)
     
     def preprocess(self, images):
         #return self.srgb2xyz(images)
-        return self.xyz2ulab(self.srgb2xyz(images))
+        return self.xyz2lab(self.srgb2xyz(images))
         
     def postprocess(self, images):
         #return self.xyz2srgb(images)
-        return self.xyz2srgb(self.ulab2xyz(images))
-        
-    def encode(self, x):
-        with tf.variable_scope(
-            'encode', reuse = tf.AUTO_REUSE
-        ):
-            x = tf.nn.selu(tf.layers.conv2d(
-                x, 32,
-                [4, 4], [2, 2], 'same', name = '1'
-            ))
-            
-            x = tf.nn.selu(tf.layers.conv2d(
-                x, 32,
-                [3, 3], [1, 1], 'same', name = '2'
-            ))
-            
-            x = tf.nn.selu(tf.layers.conv2d(
-                x, 64,
-                [3, 3], [1, 1], 'same', name = '3'
-            ))
-            
-            x = tf.nn.selu(tf.layers.conv2d(
-                x, 128,
-                [3, 3], [1, 1], 'same', name = '4'
-            ))
-            
-            #x = tf.nn.selu(tf.layers.conv2d(
-            #    x, 128,
-            #    [3, 3], [1, 1], 'same', name = '5'
-            #))
-            
-            x = tf.nn.selu(tf.layers.conv2d(
-                x, 256,
-                [3, 3], [1, 1], 'same', name = '6'
-            ))
-            
-            return tf.layers.conv2d(
-                x, 9,
-                [3, 3], [1, 1], 'same', name = 'final'
-            )
+        return self.xyz2srgb(self.lab2xyz(images))
     
-    def decode(self, x):
+    def decode(self, image):
         with tf.variable_scope(
             'transform', reuse = tf.AUTO_REUSE
         ):
-            x = tf.nn.selu(tf.layers.conv2d(
-                x, 32,
-                [3, 3], [1, 1], 'same', name = '1'
-            ))
+            x = image
             
-            x = tf.nn.selu(tf.layers.conv2d(
-                x, 32,
-                [3, 3], [1, 1], 'same', name = '2'
-            ))
+            for i in range(3):
+                x = tf.nn.selu(tf.layers.conv2d(
+                    x, 64,
+                    [3, 3], [1, 1], 'same', name = 'conv3x3_0_' + str(i)
+                ))
             
-            x = tf.nn.selu(tf.layers.conv2d(
-                x, 64,
-                [3, 3], [1, 1], 'same', name = '3'
-            ))
-            
-            x = tf.nn.selu(tf.layers.conv2d(
-                x, 128,
-                [3, 3], [1, 1], 'same', name = '4'
-            ))
-            
-            #x = tf.nn.selu(tf.layers.conv2d(
-            #    x, 128,
-            #    [3, 3], [1, 1], 'same', name = '5'
-            #))
-            
-            x = tf.nn.selu(tf.layers.conv2d(
-                x, 256,
-                [3, 3], [1, 1], 'same', name = '6'
-            ))
-            
-            x = tf.layers.conv2d_transpose(
-                x, 3, [4, 4], [2, 2], 'same', name = 'final'
+            x = tf.image.resize_nearest_neighbor(x, [self.size] * 2)
+            #x = self.lanczos3_upscale(x)
+        
+            for i in range(1):
+                x = tf.nn.selu(tf.layers.conv2d(
+                    x, 64,
+                    [3, 3], [1, 1], 'same', name = 'conv3x3_1_' + str(i)
+                ))
+                
+            x = tf.layers.conv2d(
+                x, 3,
+                [3, 3], [1, 1], 'same', name = 'conv3x3_2_final'
             )
+                
+            #x = tf.depth_to_space(x, 2)
             
             return x
             
-    def scale(self, images, noise):
+    def scale(self, images):
         with tf.variable_scope(
             'scale', reuse = tf.AUTO_REUSE
         ):
-            x = tf.concat([images, noise], -1)
-            
-            x = self.decode(x)
+            x = self.decode(images * 2 - 1)
             
             x = tf.pad(
                 x,
                 [[0, 0], [0, 0], [0, 0], [0, 1]], constant_values = 1.0
             )
             
-            return x
+            return x * 0.5 + 0.5
             
     def discriminate(self, large_images, small_images):
         with tf.variable_scope(
             'discriminate', reuse = tf.AUTO_REUSE
         ):
-            large_images *= self.lab_scale / tf.reduce_mean(self.lab_scale)
-            small_images *= self.lab_scale / tf.reduce_mean(self.lab_scale)
-            
             # cut away alpha
-            small_images = small_images[:, :, :, :3]
-            large_images = large_images[:, :, :, :3]
+            small_images = small_images[:, :, :, :3] * 2 - 1
+            large_images = large_images[:, :, :, :3] * 2 - 1
+            
+            result = []
+            
+            x = small_images
+            
+            for i in range(4):
+                x = tf.nn.selu(tf.layers.conv2d(
+                    x, 64, [3, 3], [1, 1], 'same', name = 'conv3x3_0_' + str(i)
+                ))
             
             #x = tf.concat([
             #    small_images, 
             #    tf.space_to_depth(large_images, 2)
             #], -1)
-            x = x = tf.concat([
+            x = tf.concat([
                 large_images,
-                tf.image.resize_nearest_neighbor(small_images, [self.size] * 2)
+                #self.lanczos3_upscale(small_images)[:, :, :, :3]
+                tf.image.resize_nearest_neighbor(x, [self.size] * 2)
             ], -1)
+            #x = tf.layers.conv2d_transpose(
+            #    small_images, 3, [4, 4], [2, 2], 'same', name = '0'
+            #)
+            #x = tf.concat([x, large_images], -1)
             
-            x = tf.nn.selu(tf.layers.conv2d(
-                x, 32,
-                [3, 3], [1, 1], 'valid', name = '1'
-            ))
             
-            x = tf.nn.selu(tf.layers.conv2d(
-                x, 32,
-                [3, 3], [1, 1], 'valid', name = '2'
-            ))
+            dilation = 1
             
-            x = tf.nn.selu(tf.layers.conv2d(
-                x, 64,
-                [3, 3], [1, 1], 'valid', name = '3'
-            ))
+            for i in range(2):
+                x = tf.nn.selu(tf.layers.conv2d(
+                    x, 128, [3, 3], [1, 1], 'same', 
+                    name = 'conv3x3_1_' + str(i)
+                ))
+                
+                result += [tf.layers.conv2d(
+                    x, 1, [1, 1], [1, 1], 'same', 
+                    name = 'dense_1_' + str(i)
+                )]
             
-            x = tf.nn.selu(tf.layers.conv2d(
-                x, 128,
-                [3, 3], [1, 1], 'valid', name = '4'
-            ))
-            
-            #x = tf.nn.selu(tf.layers.conv2d(
-            #    x, 256,
-            #    [3, 3], [1, 1], 'valid', name = '5'
-            #))
-            
-            x = tf.layers.conv2d(
-                x, 1,
-                [3, 3], [1, 1], 'valid', name = '6'
-            )
-            
-            return x
+            return tf.concat(result, -1)
  
     def train(self):
         step = self.session.run(self.global_step)
@@ -576,13 +482,11 @@ class GANSuperResolution:
         while True:
             while True:
                 try:
-                    real, scaled_distribution, scaled, reconstructed, \
+                    real, scaled, \
                     g_loss, d_loss, distance, rescale_loss, summary = \
                         self.session.run([
-                            self.real[:4, :, :, :],
-                            self.scaled_distribution[:4, :, :, :],
+                            self.real,
                             self.scaled,
-                            self.reconstructed[:4, :, :, :],
                             self.g_loss, self.d_loss, 
                             self.distance, self.rescale_loss,
                             self.summary
@@ -604,10 +508,8 @@ class GANSuperResolution:
 
             i = np.concatenate(
                 (
-                    real[:, :, :, :],
+                    real,
                     scaled,
-                    scaled_distribution[:, :, :, :],
-                    reconstructed[:, :, :, :],
                 ),
                 axis = 2
             )
