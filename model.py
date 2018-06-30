@@ -544,15 +544,74 @@ class GANSuperResolution:
                     global_step=step
                 )
 
-    def test(self):
-        r, step = self.session.run(
-            [self.random, self.global_step]
+    def scale_file(self, filename):
+        image = tf.Variable(
+            tf.image.decode_image(tf.read_file(filename), 3),
+            validate_shape = False
         )
 
-        i = np.concatenate(
-            [np.squeeze(x, 0) for x in np.split(r, r.shape[0])]
+        tiles = tf.Variable(
+            tf.reshape(
+                tf.extract_image_patches(
+                    [tf.pad(
+                        image, [[0, 0], [0, 0], [0, 1]], 
+                        constant_values = 255
+                    )], 
+                    [1, 128, 128, 1], [1, 128, 128, 1], [1, 1, 1, 1], "SAME"
+                ), 
+                [-1, 128, 128, 4]
+            ),
+            validate_shape = False
+        )
+        
+        result_tiles = tf.Variable(
+            tf.zeros(tf.shape(tiles) * [1, 2, 2, 1], tf.int32),
+            validate_shape = False
+        )
+        
+        index = tf.Variable(0)
+        
+        self.session.run(image.initializer)
+        self.session.run([
+            tiles.initializer, result_tiles.initializer, index.initializer
+        ])
+        
+        size = self.session.run(tf.shape(image)[:2])
+        print(size)
+        
+        step = tf.scatter_update(
+            result_tiles, [index], 
+            self.xyz2srgb(
+                self.scale(self.srgb2xyz(
+                    tf.reshape([tiles[index, :, :, :]], [1, 128, 128, 4])
+                ))
+            )
+        )
+        
+        with tf.control_dependencies([step]):
+            step = tf.assign_add(index, 1)
+    
+        tile_count = self.session.run(tf.shape(tiles)[0])
+        
+        for i in tqdm(range(tile_count)):
+            self.session.run(step)
+            
+        height = ((size[0] - 1) // 128 + 1) * 256
+        width =  ((size[1] - 1) // 128 + 1) * 256
+            
+        r = self.session.run(
+            tf.reshape(
+                tf.transpose(
+                    tf.reshape(
+                        tf.transpose(result_tiles, [0, 2, 1, 3]),
+                        [-1, width, 256, 4]
+                    ), 
+                    [0, 2, 1, 3]
+                ),
+                [-1, width, 4]
+            )
         )
 
-        scm.imsave("test/{}.jpg".format(step) , i)
+        scm.imsave("{}_scaled.png".format(filename), r)
         
     
