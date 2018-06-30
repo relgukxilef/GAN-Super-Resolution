@@ -28,7 +28,7 @@ class GANSuperResolution:
     def __init__(
         self, session, continue_train = True, 
         learning_rate = 1e-4, # explosions at 5e-5
-        batch_size = 4
+        batch_size = 2
     ):
         self.session = session
         self.learning_rate = learning_rate
@@ -132,18 +132,18 @@ class GANSuperResolution:
             self.moments[0], tf.sqrt(self.moments[1])
         ])
         
-        moments, error1, error2 = self.session.run([
-            self.moments,
-            tf.reduce_mean(tf.abs(
-                tf.to_float(self.real) -
-                tf.to_float(self.xyz2srgb(self.srgb2xyz(self.real)))
-            )),
-            tf.reduce_mean(tf.abs(
-                tf.to_float(self.srgb2xyz(self.real)) -
-                tf.to_float(self.lab2xyz(self.preprocess(self.real)))
-            ))
-        ])
-        print(moments, "error:", error1, error2)
+        #moments, error1, error2 = self.session.run([
+        #    self.moments,
+        #    tf.reduce_mean(tf.abs(
+        #        tf.to_float(self.real) -
+        #        tf.to_float(self.xyz2srgb(self.srgb2xyz(self.real)))
+        #    )),
+        #    tf.reduce_mean(tf.abs(
+        #        tf.to_float(self.srgb2xyz(self.real)) -
+        #        tf.to_float(self.lab2xyz(self.preprocess(self.real)))
+        #    ))
+        #])
+        #print(moments, "error:", error1, error2)
         #return
         
         real = self.srgb2xyz(self.real)
@@ -151,6 +151,9 @@ class GANSuperResolution:
         downscaled = self.lanczos3_downscale(real)
         
         self.downscaled = self.xyz2srgb(downscaled)
+        self.nearest_neighbor = tf.image.resize_nearest_neighbor(
+            self.downscaled, [self.size] * 2
+        )
         
         scaled = self.scale(downscaled)
         
@@ -163,11 +166,11 @@ class GANSuperResolution:
         # losses
         fake_logits = self.discriminate(
             scaled, downscaled
-            #self.xyz2lab(scaled), self.xyz2lab(downscaled)
+            #self.xyz2lab(scaled), downscaled
         )
         real_logits = self.discriminate(
             real, downscaled
-            #self.xyz2lab(real), self.xyz2lab(downscaled)
+            #self.xyz2lab(real), downscaled
         )
         
         def visual_difference(real, fake):
@@ -180,25 +183,21 @@ class GANSuperResolution:
             tf.reduce_mean(fake_logits) - tf.reduce_mean(real_logits)
         )
         
-        self.rescale_loss = tf.reduce_mean((
+        self.rescale_loss = tf.reduce_mean(tf.abs(
             self.lanczos3_downscale(real, "VALID") - 
             redownscaled
-        )**2)
+        ))
         
         median_loss = tf.reduce_mean((real - scaled)**2)
         #median_loss = visual_difference(real, scaled)
         
         self.g_loss = sum([
-            1e-3 * tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
+            tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
                 logits = fake_logits, labels = tf.ones_like(fake_logits)
             )), # non-saturating GAN
-            #tf.minimum(1.0, tf.to_float(self.global_step) / 2e5) *
             #tf.reduce_mean((fake_logits - 0.5)**2),
-            #2 * median_loss,
-            #2 * self.rescale_loss,
-            #2 * tf.reduce_mean(tf.abs(real - reconstructed)),
-            #tf.reduce_mean((encoded_distribution - encoded_reconstruction)**2),
-            tf.reduce_mean((real - scaled)**2)
+            self.rescale_loss,
+            #tf.reduce_mean((real - scaled)**2)
         ])
         self.d_loss = sum([
             tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
@@ -233,17 +232,17 @@ class GANSuperResolution:
         )
         
         
-        with tf.variable_scope('average'): 
-            exponentialAverages = tf.train.ExponentialMovingAverage(0.995) 
-            with tf.control_dependencies([self.g_optimizer]):
-                self.g_optimizer = exponentialAverages.apply([ 
-                    self.g_loss, self.d_loss, self.distance, median_loss
-                ])
-                
-                self.g_loss = exponentialAverages.average(self.g_loss) 
-                self.d_loss = exponentialAverages.average(self.d_loss) 
-                self.distance = exponentialAverages.average(self.distance)
-                median_loss = exponentialAverages.average(median_loss)
+        #with tf.variable_scope('average'): 
+        #    exponentialAverages = tf.train.ExponentialMovingAverage(0.995) 
+        #    with tf.control_dependencies([self.g_optimizer]):
+        #        self.g_optimizer = exponentialAverages.apply([ 
+        #            self.g_loss, self.d_loss, self.distance, median_loss
+        #        ])
+        #        
+        #        self.g_loss = exponentialAverages.average(self.g_loss) 
+        #        self.d_loss = exponentialAverages.average(self.d_loss) 
+        #        self.distance = exponentialAverages.average(self.distance)
+        #        median_loss = exponentialAverages.average(median_loss)
         
 
         self.saver = tf.train.Saver(max_to_keep = 2)
@@ -392,16 +391,16 @@ class GANSuperResolution:
         ):
             x = image
             
-            for i in range(3):
+            for i in range(5):
                 x = tf.nn.selu(tf.layers.conv2d(
                     x, 64,
                     [3, 3], [1, 1], 'same', name = 'conv3x3_0_' + str(i)
                 ))
             
-            x = tf.image.resize_nearest_neighbor(x, [self.size] * 2)
+            x = tf.image.resize_nearest_neighbor(x, tf.shape(x)[1:3] * 2)
             #x = self.lanczos3_upscale(x)
         
-            for i in range(1):
+            for i in range(2):
                 x = tf.nn.selu(tf.layers.conv2d(
                     x, 64,
                     [3, 3], [1, 1], 'same', name = 'conv3x3_1_' + str(i)
@@ -434,14 +433,14 @@ class GANSuperResolution:
             'discriminate', reuse = tf.AUTO_REUSE
         ):
             # cut away alpha
-            small_images = small_images[:, :, :, :3] * 2 - 1
-            large_images = large_images[:, :, :, :3] * 2 - 1
+            small_images = small_images * 2 - 1
+            large_images = large_images * 2 - 1
             
             result = []
             
             x = small_images
             
-            for i in range(4):
+            for i in range(5):
                 x = tf.nn.selu(tf.layers.conv2d(
                     x, 64, [3, 3], [1, 1], 'same', name = 'conv3x3_0_' + str(i)
                 ))
@@ -452,7 +451,7 @@ class GANSuperResolution:
             #], -1)
             x = tf.concat([
                 large_images,
-                #self.lanczos3_upscale(small_images)[:, :, :, :3]
+                #self.lanczos3_upscale(small_images)
                 tf.image.resize_nearest_neighbor(x, [self.size] * 2)
             ], -1)
             #x = tf.layers.conv2d_transpose(
@@ -463,7 +462,7 @@ class GANSuperResolution:
             
             dilation = 1
             
-            for i in range(2):
+            for i in range(3):
                 x = tf.nn.selu(tf.layers.conv2d(
                     x, 128, [3, 3], [1, 1], 'same', 
                     name = 'conv3x3_1_' + str(i)
@@ -482,11 +481,12 @@ class GANSuperResolution:
         while True:
             while True:
                 try:
-                    real, scaled, \
+                    real, scaled, nearest_neighbor, \
                     g_loss, d_loss, distance, rescale_loss, summary = \
                         self.session.run([
                             self.real,
                             self.scaled,
+                            self.nearest_neighbor,
                             self.g_loss, self.d_loss, 
                             self.distance, self.rescale_loss,
                             self.summary
@@ -508,8 +508,9 @@ class GANSuperResolution:
 
             i = np.concatenate(
                 (
-                    real,
+                    nearest_neighbor,
                     scaled,
+                    real,
                 ),
                 axis = 2
             )
@@ -549,7 +550,7 @@ class GANSuperResolution:
             tf.image.decode_image(tf.read_file(filename), 3),
             validate_shape = False
         )
-
+        
         tiles = tf.Variable(
             tf.reshape(
                 tf.extract_image_patches(
