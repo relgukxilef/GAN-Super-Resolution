@@ -27,7 +27,7 @@ def nice_power(x, n, s, e):
 class GANSuperResolution:
     def __init__(
         self, session, continue_train = True, 
-        learning_rate = 1e-4, # explosions at 5e-5
+        learning_rate = 1e-4,
         batch_size = 2
     ):
         self.session = session
@@ -147,56 +147,46 @@ class GANSuperResolution:
         #return
         
         real = self.srgb2xyz(self.real)
+        real_half = self.lanczos3_downscale(real)
+        real_quarter = self.lanczos3_downscale(real_half)
         #tampered = self.preprocess(self.tampered)
-        downscaled = self.lanczos3_downscale(real)
         
-        self.downscaled = self.xyz2srgb(downscaled)
+        self.downscaled = self.xyz2srgb(real_half)
         self.nearest_neighbor = tf.image.resize_nearest_neighbor(
             self.downscaled, [self.size] * 2
         )
         
-        scaled = self.scale(downscaled)
+        fake_half = self.scale(real_quarter)
+        fake = self.scale(fake_half)
         
         #self.cleaned = self.xyz2srgb(cleaned)
-        self.scaled = self.xyz2srgb(scaled)
+        self.scaled = self.xyz2srgb(self.scale(real_half))
+        self.scaled2 = self.xyz2srgb(fake)
         
-        redownscaled = self.lanczos3_downscale(scaled, "VALID")
-        self.redownscaled = self.xyz2srgb(redownscaled)
+        fake_half_quarter = self.lanczos3_downscale(fake_half)
         
         # losses
         fake_logits = self.discriminate(
-            scaled, downscaled
-            #self.xyz2lab(scaled), downscaled
+            fake, real_quarter
         )
         real_logits = self.discriminate(
-            real, downscaled
-            #self.xyz2lab(real), downscaled
+            real, real_quarter
         )
-        
-        def visual_difference(real, fake):
-            return tf.reduce_mean((
-                #self.xyz2lab(real) - self.xyz2lab(fake)
-                nice_power(real, 1/3, 1e-2, 1) - nice_power(fake, 1/3, 1e-2, 1)
-            )**2)
         
         self.distance = (
             tf.reduce_mean(fake_logits) - tf.reduce_mean(real_logits)
         )
         
         self.rescale_loss = tf.reduce_mean(tf.abs(
-            self.lanczos3_downscale(real, "VALID") - 
-            redownscaled
+            fake_half_quarter - real_quarter
         ))
-        
-        median_loss = tf.reduce_mean((real - scaled)**2)
-        #median_loss = visual_difference(real, scaled)
         
         self.g_loss = sum([
             tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
                 logits = fake_logits, labels = tf.ones_like(fake_logits)
             )), # non-saturating GAN
             #tf.reduce_mean((fake_logits - 0.5)**2),
-            self.rescale_loss,
+            1e2 * self.rescale_loss,
             #tf.reduce_mean((real - scaled)**2)
         ])
         self.d_loss = sum([
@@ -214,19 +204,19 @@ class GANSuperResolution:
         g_variables = [v for v in variables if 'discriminate' not in v.name]
         d_variables = [v for v in variables if 'discriminate' in v.name]
         
-        learning_rate = tf.train.exponential_decay( 
-            self.learning_rate, self.global_step, 100000, 0.5, True 
-        )
+        # Adam learning rate
+        learning_rate = self.learning_rate / (
+            tf.to_float(self.global_step) / 2.5e4 + 1
+        )**0.5
         
         self.g_optimizer = tf.train.AdamOptimizer(
-            learning_rate#, 0.5, 0.9#, use_nesterov = True#, beta1 = 0.5#, beta2 = 0.9
+            learning_rate#, 0.9, use_nesterov = True#, beta1 = 0.5#, beta2 = 0.9
         ).minimize(
             self.g_loss, self.global_step, var_list = g_variables
         )
 
         self.d_optimizer = tf.train.AdamOptimizer(
-            learning_rate#, 0.5, 0.9#, use_nesterov = True#, beta1 = 0.5#, beta2 = 0.9
-            #epsilon = 1e-2
+            learning_rate#, 0.9, use_nesterov = True#, beta1 = 0.5#, beta2 = 0.9
         ).minimize(
             self.d_loss, var_list = d_variables
         )
@@ -250,7 +240,6 @@ class GANSuperResolution:
         tf.summary.scalar('generator loss', self.g_loss)
         tf.summary.scalar('discriminator loss', self.d_loss)
         tf.summary.scalar('distance', self.distance)
-        tf.summary.scalar('median_loss', median_loss)
         tf.summary.histogram('fake score', fake_logits)
         tf.summary.histogram('real score', real_logits)
         
@@ -396,14 +385,22 @@ class GANSuperResolution:
                     x, 64,
                     [3, 3], [1, 1], 'same', name = 'conv3x3_0_' + str(i)
                 ))
+                #x = tf.nn.selu(tf.layers.conv2d(
+                #    x, 64,
+                #    [1, 1], [1, 1], 'same', name = 'dense_0_' + str(i)
+                #))
             
-            x = tf.image.resize_nearest_neighbor(x, tf.shape(x)[1:3] * 2)
+            x = tf.image.resize_bilinear(x, tf.shape(x)[1:3] * 2)
             #x = self.lanczos3_upscale(x)
         
             for i in range(2):
                 x = tf.nn.selu(tf.layers.conv2d(
-                    x, 64,
+                    x, 128,
                     [3, 3], [1, 1], 'same', name = 'conv3x3_1_' + str(i)
+                ))
+                x = tf.nn.selu(tf.layers.conv2d(
+                    x, 128,
+                    [1, 1], [1, 1], 'same', name = 'dense_1_' + str(i)
                 ))
                 
             x = tf.layers.conv2d(
@@ -444,6 +441,15 @@ class GANSuperResolution:
                 x = tf.nn.selu(tf.layers.conv2d(
                     x, 64, [3, 3], [1, 1], 'same', name = 'conv3x3_0_' + str(i)
                 ))
+                #x = tf.nn.selu(tf.layers.conv2d(
+                #    x, 64,
+                #    [1, 1], [1, 1], 'same', name = 'dense_0_' + str(i)
+                #))
+                
+            x = tf.image.resize_bilinear(x, tf.shape(x)[1:3] * 2)
+            x = tf.nn.selu(tf.layers.conv2d(
+                x, 64, [3, 3], [1, 1], 'same', name = 'conv3x3_0.5_' + str(i)
+            ))
             
             #x = tf.concat([
             #    small_images, 
@@ -452,7 +458,7 @@ class GANSuperResolution:
             x = tf.concat([
                 large_images,
                 #self.lanczos3_upscale(small_images)
-                tf.image.resize_nearest_neighbor(x, [self.size] * 2)
+                tf.image.resize_bilinear(x, tf.shape(x)[1:3] * 2)
             ], -1)
             #x = tf.layers.conv2d_transpose(
             #    small_images, 3, [4, 4], [2, 2], 'same', name = '0'
@@ -462,15 +468,19 @@ class GANSuperResolution:
             
             dilation = 1
             
-            for i in range(3):
+            for i in range(2):
                 x = tf.nn.selu(tf.layers.conv2d(
                     x, 128, [3, 3], [1, 1], 'same', 
                     name = 'conv3x3_1_' + str(i)
                 ))
+                x = tf.nn.selu(tf.layers.conv2d(
+                    x, 128,
+                    [1, 1], [1, 1], 'same', name = 'dense_1_' + str(i)
+                ))
                 
                 result += [tf.layers.conv2d(
                     x, 1, [1, 1], [1, 1], 'same', 
-                    name = 'dense_1_' + str(i)
+                    name = 'dense_result_1_' + str(i)
                 )]
             
             return tf.concat(result, -1)
@@ -481,11 +491,11 @@ class GANSuperResolution:
         while True:
             while True:
                 try:
-                    real, scaled, nearest_neighbor, \
+                    real, scaled, scaled2, nearest_neighbor, \
                     g_loss, d_loss, distance, rescale_loss, summary = \
                         self.session.run([
                             self.real,
-                            self.scaled,
+                            self.scaled, self.scaled2,
                             self.nearest_neighbor,
                             self.g_loss, self.d_loss, 
                             self.distance, self.rescale_loss,
@@ -509,7 +519,7 @@ class GANSuperResolution:
             i = np.concatenate(
                 (
                     nearest_neighbor,
-                    scaled,
+                    scaled, scaled2,
                     real,
                 ),
                 axis = 2
