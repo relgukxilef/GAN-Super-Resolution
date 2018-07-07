@@ -152,13 +152,9 @@ class GANSuperResolution:
         #print(moments, "error:", error1, error2)
         #return
         
-        #real = self.srgb2xyz(self.real)
         real = tf.to_float(self.real) / 255
-        downscaled = self.lanczos3_downscale(real)
-        #downscaled = tamper(downscaled)
-        
-        # quantization
-        #downscaled = self.srgb2xyz(self.xyz2srgb(downscaled))
+        real_half = self.lanczos3_downscale(real)
+        real_quarter = self.lanczos3_downscale(real_half)
         
         self.downscaled = tf.to_int32(tf.minimum(tf.maximum(
             downscaled * 255, 0
@@ -167,43 +163,31 @@ class GANSuperResolution:
             self.downscaled, [self.size] * 2
         )
         
-        scaled = self.scale(downscaled)
+        fake_half = self.scale(real_quarter)
+        fake = self.scale(fake_half)
         
         #self.cleaned = self.xyz2srgb(cleaned)
         self.scaled = tf.to_int32(tf.minimum(tf.maximum(
             scaled * 255, 0
         ), 255))
         
-        redownscaled = self.lanczos3_downscale(scaled, "VALID")
-        #self.redownscaled = self.xyz2srgb(redownscaled)
+        fake_half_quarter = self.lanczos3_downscale(fake_half)
         
         # losses
         fake_logits = self.discriminate(
-            scaled, downscaled
-            #self.xyz2lab(scaled), downscaled
+            fake, real_quarter
         )
         real_logits = self.discriminate(
-            real, downscaled
-            #self.xyz2lab(real), downscaled
+            real, real_quarter
         )
-        
-        def visual_difference(real, fake):
-            return tf.reduce_mean((
-                #self.xyz2lab(real) - self.xyz2lab(fake)
-                nice_power(real, 1/3, 1e-2, 1) - nice_power(fake, 1/3, 1e-2, 1)
-            )**2)
         
         self.distance = (
             tf.reduce_mean(fake_logits) - tf.reduce_mean(real_logits)
         )
         
         self.rescale_loss = tf.reduce_mean(tf.abs(
-            self.lanczos3_downscale(real, "VALID") - 
-            redownscaled
+            fake_half_quarter - real_quarter
         ))
-        
-        median_loss = tf.reduce_mean((real - scaled)**2)
-        #median_loss = visual_difference(real, scaled)
         
         self.g_loss = sum([
             tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
@@ -235,14 +219,13 @@ class GANSuperResolution:
         learning_rate = self.learning_rate
         
         self.g_optimizer = tf.train.AdamOptimizer(
-            learning_rate#, 0.5, 0.9#, use_nesterov = True#, beta1 = 0.5#, beta2 = 0.9
+            learning_rate#, 0.9, use_nesterov = True#, beta1 = 0.5#, beta2 = 0.9
         ).minimize(
             self.g_loss, self.global_step, var_list = g_variables
         )
 
         self.d_optimizer = tf.train.AdamOptimizer(
-            learning_rate#, 0.5, 0.9#, use_nesterov = True#, beta1 = 0.5#, beta2 = 0.9
-            #epsilon = 1e-2
+            learning_rate#, 0.9, use_nesterov = True#, beta1 = 0.5#, beta2 = 0.9
         ).minimize(
             self.d_loss, var_list = d_variables
         )
@@ -266,7 +249,6 @@ class GANSuperResolution:
         tf.summary.scalar('generator loss', self.g_loss)
         tf.summary.scalar('discriminator loss', self.d_loss)
         tf.summary.scalar('distance', self.distance)
-        tf.summary.scalar('median_loss', median_loss)
         tf.summary.histogram('fake score', fake_logits)
         tf.summary.histogram('real score', real_logits)
         
@@ -422,7 +404,7 @@ class GANSuperResolution:
 
             for i in range(1):
                 x = tf.nn.selu(tf.layers.conv2d(
-                    x, 64,
+                    x, 128,
                     [3, 3], [1, 1], 'same', name = 'conv3x3_1_' + str(i)
                 ))
                 x = tf.nn.selu(tf.layers.conv2d(
@@ -498,11 +480,11 @@ class GANSuperResolution:
         while True:
             while True:
                 try:
-                    real, scaled, nearest_neighbor, \
+                    real, scaled, scaled2, nearest_neighbor, \
                     g_loss, d_loss, distance, rescale_loss, summary = \
                         self.session.run([
                             self.real,
-                            self.scaled,
+                            self.scaled, self.scaled2,
                             self.nearest_neighbor,
                             self.g_loss, self.d_loss, 
                             self.distance, self.rescale_loss,
@@ -526,7 +508,7 @@ class GANSuperResolution:
             i = np.concatenate(
                 (
                     nearest_neighbor,
-                    scaled,
+                    scaled, scaled2,
                     real,
                 ),
                 axis = 2
