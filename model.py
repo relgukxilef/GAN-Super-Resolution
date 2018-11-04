@@ -27,8 +27,8 @@ def nice_power(x, n, s, e):
 class GANSuperResolution:
     def __init__(
         self, session, continue_train = True, 
-        learning_rate = 1e-5,
-        batch_size = 4
+        learning_rate = 1e-4,
+        batch_size = 2
     ):
         self.session = session
         self.learning_rate = learning_rate
@@ -406,36 +406,33 @@ class GANSuperResolution:
         ):
             x = image
             
-            for i in range(4):
+            for i in range(6):
                 x = tf.nn.selu(tf.layers.conv2d(
-                    x, 64,
+                    x, 128,
                     [3, 3], [1, 1], 'same', name = 'conv3x3_0_' + str(i)
                 ))
                 x = tf.nn.selu(tf.layers.conv2d(
-                    x, 64,
+                    x, 128,
                     [1, 1], [1, 1], 'same', name = 'dense_0_' + str(i)
                 ))
             
-            x = tf.image.resize_nearest_neighbor(x, tf.shape(x)[1:3] * 2)
-            #x = tf.depth_to_space(x, 2)
-            #x = self.lanczos3_upscale(x)
+            x = tf.layers.conv2d_transpose(x, 3, [2, 2], [2, 2], 'same', name = 'deconv2x2')
+            x = tf.layers.average_pooling2d(x, [2, 2], [1, 1], 'same') * 2
         
-            for i in range(6):
-                x = tf.nn.selu(tf.layers.conv2d(
-                    x, 64,
-                    [3, 3], [1, 1], 'same', name = 'conv3x3_1_' + str(i)
-                ))
-                x = tf.nn.selu(tf.layers.conv2d(
-                    x, 64,
-                    [1, 1], [1, 1], 'same', name = 'dense_1_' + str(i)
-                ))
+            #for i in range(1):
+            #    x = tf.nn.selu(tf.layers.conv2d(
+            #        x, 64,
+            #        [3, 3], [1, 1], 'same', name = 'conv3x3_1_' + str(i)
+            #    ))
+            #    x = tf.nn.selu(tf.layers.conv2d(
+            #        x, 64,
+            #        [1, 1], [1, 1], 'same', name = 'dense_1_' + str(i)
+            #    ))
                 
-            x = tf.layers.conv2d(
-                x, 3,
-                [1, 1], [1, 1], 'same', name = 'conv3x3_2_final'
-            )
-                
-            #x = tf.depth_to_space(x, 2)
+            #x = tf.layers.conv2d(
+            #    x, 3,
+            #    [1, 1], [1, 1], 'same', name = 'conv3x3_2_final'
+            #)
             
             return x
             
@@ -461,32 +458,9 @@ class GANSuperResolution:
             
             result = []
             
-            x = small_images
+            x = large_images
             
             for i in range(4):
-                x = tf.nn.selu(tf.layers.conv2d(
-                    x, 64, [3, 3], [1, 1], 'same', name = 'conv3x3_0_' + str(i)
-                ))
-                x = tf.nn.selu(tf.layers.conv2d(
-                    x, 64,
-                    [1, 1], [1, 1], 'same', name = 'dense_0_' + str(i)
-                ))
-            
-            #x = tf.concat([
-            #    large_images, 
-            #    tf.depth_to_space(x, 2)
-            #], -1)
-            x = tf.concat([
-                large_images,
-                tf.image.resize_nearest_neighbor(x, tf.shape(x)[1:3] * 2)
-            ], -1)
-            #x = tf.layers.conv2d_transpose(
-            #    small_images, 3, [4, 4], [2, 2], 'same', name = '0'
-            #)
-            #x = tf.concat([x, large_images], -1)
-            
-            
-            for i in range(6):
                 x = tf.nn.selu(tf.layers.conv2d(
                     x, 64, 
                     [3, 3], [1, 1], 'same', name = 'conv3x3_1_' + str(i)
@@ -530,10 +504,6 @@ class GANSuperResolution:
                 ).format(step, g_loss, rescale_loss, d_loss, distance)
             )
             
-            #scaled_distribution[
-            #    :, :redownscaled.shape[1], :redownscaled.shape[2], :
-            #] = redownscaled
-
             i = np.concatenate(
                 (
                     nearest_neighbor,
