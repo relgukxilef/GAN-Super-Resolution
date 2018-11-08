@@ -28,7 +28,7 @@ class GANSuperResolution:
     def __init__(
         self, session, continue_train = True, 
         learning_rate = 1e-5,
-        batch_size = 4
+        batch_size = 2
     ):
         self.session = session
         self.learning_rate = learning_rate
@@ -50,7 +50,7 @@ class GANSuperResolution:
             image = tf.image.decode_image(tf.read_file(path), 3)
             return tf.data.Dataset.from_tensor_slices([
                 tf.random_crop(image, [self.size, self.size, 3])
-                for _ in range(20)
+                for _ in range(40)
             ])
             #return tf.data.Dataset.from_tensor_slices(
             #    tf.reshape(
@@ -155,7 +155,7 @@ class GANSuperResolution:
         #real = self.srgb2xyz(self.real)
         real = tf.to_float(self.real) / 255
         downscaled = self.lanczos3_downscale(real)
-        downscaled = tamper(downscaled)
+        #downscaled = tamper(downscaled)
         
         # quantization
         #downscaled = self.srgb2xyz(self.xyz2srgb(downscaled))
@@ -229,9 +229,10 @@ class GANSuperResolution:
         d_variables = [v for v in variables if 'discriminate' in v.name]
         
         # Adam learning rate 
-        learning_rate = self.learning_rate / ( 
-            tf.to_float(self.global_step) / 1e5 + 1 
-        )**0.5
+        #learning_rate = self.learning_rate / ( 
+        #    tf.to_float(self.global_step) / 1e5 + 1 
+        #)**0.5
+        learning_rate = self.learning_rate
         
         self.g_optimizer = tf.train.AdamOptimizer(
             learning_rate#, 0.5, 0.9#, use_nesterov = True#, beta1 = 0.5#, beta2 = 0.9
@@ -416,11 +417,10 @@ class GANSuperResolution:
                     [1, 1], [1, 1], 'same', name = 'dense_0_' + str(i)
                 ))
             
-            x = tf.image.resize_nearest_neighbor(x, tf.shape(x)[1:3] * 2)
-            #x = tf.depth_to_space(x, 2)
-            #x = self.lanczos3_upscale(x)
-        
-            for i in range(6):
+            x = tf.layers.conv2d_transpose(x, 64, [2, 2], [2, 2], 'same', name = 'deconv2x2')
+            x = tf.layers.average_pooling2d(x, [2, 2], [1, 1], 'same') * 2
+
+            for i in range(1):
                 x = tf.nn.selu(tf.layers.conv2d(
                     x, 64,
                     [3, 3], [1, 1], 'same', name = 'conv3x3_1_' + str(i)
@@ -429,14 +429,12 @@ class GANSuperResolution:
                     x, 64,
                     [1, 1], [1, 1], 'same', name = 'dense_1_' + str(i)
                 ))
-                
-            x = tf.layers.conv2d(
-                x, 3,
-                [1, 1], [1, 1], 'same', name = 'conv3x3_2_final'
-            )
-                
-            #x = tf.depth_to_space(x, 2)
             
+            x = tf.nn.selu(tf.layers.conv2d(
+                x, 3,
+                [1, 1], [1, 1], 'same', name = 'dense_final'
+            ))
+
             return x
             
     def scale(self, images):
@@ -472,27 +470,18 @@ class GANSuperResolution:
                     [1, 1], [1, 1], 'same', name = 'dense_0_' + str(i)
                 ))
             
-            #x = tf.concat([
-            #    large_images, 
-            #    tf.depth_to_space(x, 2)
-            #], -1)
-            x = tf.concat([
-                large_images,
-                tf.image.resize_nearest_neighbor(x, tf.shape(x)[1:3] * 2)
-            ], -1)
-            #x = tf.layers.conv2d_transpose(
-            #    small_images, 3, [4, 4], [2, 2], 'same', name = '0'
-            #)
-            #x = tf.concat([x, large_images], -1)
+            x = tf.layers.conv2d_transpose(x, 64, [2, 2], [2, 2], 'same', name = 'deconv2x2')
+            x = tf.nn.selu(tf.layers.average_pooling2d(x, [2, 2], [1, 1], 'same') * 2)
+
+            x = tf.concat([large_images, x], -1)
             
-            
-            for i in range(6):
+            for i in range(2):
                 x = tf.nn.selu(tf.layers.conv2d(
-                    x, 64, 
+                    x, 128, 
                     [3, 3], [1, 1], 'same', name = 'conv3x3_1_' + str(i)
                 ))
                 x = tf.nn.selu(tf.layers.conv2d(
-                    x, 64,
+                    x, 128,
                     [1, 1], [1, 1], 'same', name = 'dense_1_' + str(i)
                 ))
                 
@@ -564,7 +553,7 @@ class GANSuperResolution:
                     except tf.errors.InvalidArgumentError as e:
                         print(e.message)
                 
-            if step % 4000 == 0:
+            if step % 8000 == 0:
                 pass
                 print("saving iteration " + str(step))
                 self.saver.save(
