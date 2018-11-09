@@ -27,8 +27,8 @@ def nice_power(x, n, s, e):
 class GANSuperResolution:
     def __init__(
         self, session, continue_train = True, 
-        learning_rate = 1e-5,
-        batch_size = 2
+        learning_rate = 1e-4,
+        batch_size = 4
     ):
         self.session = session
         self.learning_rate = learning_rate
@@ -38,7 +38,7 @@ class GANSuperResolution:
         self.max_filters = 128
         self.dimensions = 32
         self.checkpoint_path = "checkpoints"
-        self.size = 64
+        self.size = 128
         
         self.global_step = tf.Variable(0, name = 'global_step')
 
@@ -153,25 +153,26 @@ class GANSuperResolution:
         #return
         
         real = tf.to_float(self.real) / 255
-        real_half = self.lanczos3_downscale(real)
-        real_quarter = self.lanczos3_downscale(real_half)
+        real_half = tf.minimum(tf.maximum(self.lanczos3_downscale(real), 0), 255)
+        real_quarter = tf.minimum(tf.maximum(self.lanczos3_downscale(real_half), 0), 255)
         
-        self.downscaled = tf.to_int32(tf.minimum(tf.maximum(
-            downscaled * 255, 0
+        self.real_quarter = tf.to_int32(tf.minimum(tf.maximum(
+            real_quarter * 255, 0
         ), 255))
         self.nearest_neighbor = tf.image.resize_nearest_neighbor(
-            self.downscaled, [self.size] * 2
+            self.real_quarter, [self.size] * 2
         )
         
-        fake_half = self.scale(real_quarter)
-        fake = self.scale(fake_half)
+        fake_half = tf.minimum(tf.maximum(self.scale(real_quarter), 0), 255)
+        fake = tf.minimum(tf.maximum(self.scale(fake_half), 0), 255)
         
         #self.cleaned = self.xyz2srgb(cleaned)
-        self.scaled = tf.to_int32(tf.minimum(tf.maximum(
-            scaled * 255, 0
+        self.fake = tf.to_int32(tf.minimum(tf.maximum(
+            fake * 255, 0
         ), 255))
-        
-        fake_half_quarter = self.lanczos3_downscale(fake_half)
+        self.fake_half = tf.to_int32(tf.minimum(tf.maximum(
+            fake_half * 255, 0
+        ), 255))
         
         # losses
         fake_logits = self.discriminate(
@@ -180,22 +181,17 @@ class GANSuperResolution:
         real_logits = self.discriminate(
             real, real_quarter
         )
-        
+
         self.distance = (
             tf.reduce_mean(fake_logits) - tf.reduce_mean(real_logits)
         )
         
-        self.rescale_loss = tf.reduce_mean(tf.abs(
-            fake_half_quarter - real_quarter
-        ))
-        
         self.g_loss = sum([
-            tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
-                logits = fake_logits, labels = tf.ones_like(fake_logits)
-            )), # non-saturating GAN
-            #tf.reduce_mean((fake_logits - 0.5)**2),
-            #self.rescale_loss,
-            tf.reduce_mean(tf.abs(real - scaled))
+            #tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
+            #    logits = fake_logits, labels = tf.ones_like(fake_logits)
+            #)), # non-saturating GAN
+            tf.reduce_mean(tf.abs(real - fake)),
+            tf.reduce_mean(tf.abs(real_half - fake_half)),
         ])
         self.d_loss = sum([
             tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
@@ -204,8 +200,6 @@ class GANSuperResolution:
             tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
                 logits = fake_logits, labels = tf.zeros_like(fake_logits)
             )), 
-            #tf.reduce_mean((real_logits - 0.5)**2),
-            #tf.reduce_mean((fake_logits + 0.5)**2),
         ])
         
         variables = tf.trainable_variables()
@@ -248,7 +242,6 @@ class GANSuperResolution:
         
         tf.summary.scalar('generator loss', self.g_loss)
         tf.summary.scalar('discriminator loss', self.d_loss)
-        tf.summary.scalar('distance', self.distance)
         tf.summary.histogram('fake score', fake_logits)
         tf.summary.histogram('real score', real_logits)
         
@@ -377,11 +370,15 @@ class GANSuperResolution:
     
     def preprocess(self, images):
         #return self.srgb2xyz(images)
-        return self.xyz2lab(self.srgb2xyz(images))
+        #return self.xyz2lab(self.srgb2xyz(images))
+        return tf.to_float(images) / 255
         
     def postprocess(self, images):
         #return self.xyz2srgb(images)
-        return self.xyz2srgb(self.lab2xyz(images))
+        #return self.xyz2srgb(self.lab2xyz(images))
+        return tf.to_int32(tf.minimum(tf.maximum(
+            images * 255, 0
+        ), 255))
     
     def decode(self, image):
         with tf.variable_scope(
@@ -404,7 +401,7 @@ class GANSuperResolution:
 
             for i in range(1):
                 x = tf.nn.selu(tf.layers.conv2d(
-                    x, 128,
+                    x, 64,
                     [3, 3], [1, 1], 'same', name = 'conv3x3_1_' + str(i)
                 ))
                 x = tf.nn.selu(tf.layers.conv2d(
@@ -452,8 +449,8 @@ class GANSuperResolution:
                     [1, 1], [1, 1], 'same', name = 'dense_0_' + str(i)
                 ))
             
-            x = tf.layers.conv2d_transpose(x, 64, [2, 2], [2, 2], 'same', name = 'deconv2x2')
-            x = tf.nn.selu(tf.layers.average_pooling2d(x, [2, 2], [1, 1], 'same') * 2)
+            x = tf.layers.conv2d_transpose(x, 64, [4, 4], [4, 4], 'same', name = 'deconv2x2')
+            x = tf.nn.selu(tf.layers.average_pooling2d(x, [4, 4], [1, 1], 'same') * 2)
 
             x = tf.concat([large_images, x], -1)
             
@@ -480,14 +477,14 @@ class GANSuperResolution:
         while True:
             while True:
                 try:
-                    real, scaled, scaled2, nearest_neighbor, \
-                    g_loss, d_loss, distance, rescale_loss, summary = \
+                    real, fake, fake_half, nearest_neighbor, \
+                    g_loss, d_loss, distance, summary = \
                         self.session.run([
                             self.real,
-                            self.scaled, self.scaled2,
+                            self.fake, self.fake_half,
                             self.nearest_neighbor,
                             self.g_loss, self.d_loss, 
-                            self.distance, self.rescale_loss,
+                            self.distance,
                             self.summary
                         ])
                     break
@@ -496,9 +493,9 @@ class GANSuperResolution:
                 
             print(
                 (
-                    "#{}, g_loss: {:.4f}, rescale_loss: {:.4f}, " + 
+                    "#{}, g_loss: {:.4f}, " + 
                     "d_loss: {:.4f}, distance: {:.4f}"
-                ).format(step, g_loss, rescale_loss, d_loss, distance)
+                ).format(step, g_loss, d_loss, distance)
             )
             
             #scaled_distribution[
@@ -508,7 +505,7 @@ class GANSuperResolution:
             i = np.concatenate(
                 (
                     nearest_neighbor,
-                    scaled, scaled2,
+                    fake,
                     real,
                 ),
                 axis = 2
@@ -526,7 +523,7 @@ class GANSuperResolution:
                     try:
                         _, step = self.session.run([
                             [
-                                self.d_optimizer, 
+                                #self.d_optimizer, 
                                 self.g_optimizer
                             ],
                             self.global_step
@@ -553,13 +550,10 @@ class GANSuperResolution:
         tiles = tf.Variable(
             tf.reshape(
                 tf.extract_image_patches(
-                    [tf.pad(
-                        image, [[0, 0], [0, 0], [0, 1]], 
-                        constant_values = 255
-                    )], 
+                    [image],
                     [1, 128, 128, 1], [1, 128, 128, 1], [1, 1, 1, 1], "SAME"
                 ), 
-                [-1, 128, 128, 4]
+                [-1, 128, 128, 3]
             ),
             validate_shape = False
         )
@@ -581,11 +575,9 @@ class GANSuperResolution:
         
         step = tf.scatter_update(
             result_tiles, [index], 
-            self.xyz2srgb(
-                self.scale(self.srgb2xyz(
-                    tf.reshape([tiles[index, :, :, :]], [1, 128, 128, 4])
-                ))
-            )
+            self.postprocess(self.scale(self.preprocess(
+                tf.reshape([tiles[index, :, :, :]], [1, 128, 128, 3])
+            )))
         )
         
         with tf.control_dependencies([step]):
@@ -604,11 +596,11 @@ class GANSuperResolution:
                 tf.transpose(
                     tf.reshape(
                         tf.transpose(result_tiles, [0, 2, 1, 3]),
-                        [-1, width, 256, 4]
+                        [-1, width, 256, 3]
                     ), 
                     [0, 2, 1, 3]
                 ),
-                [-1, width, 4]
+                [-1, width, 3]
             )
         )
 
