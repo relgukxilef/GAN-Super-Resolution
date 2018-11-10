@@ -47,10 +47,10 @@ class GANSuperResolution:
         self.paths = glob("data/half/*.png")
                     
         def load(path):
-            image = tf.image.decode_image(tf.read_file(path), 3)
+            image = tf.image.decode_image(tf.read_file(path), 4)
             return tf.data.Dataset.from_tensor_slices([
-                tf.random_crop(image, [self.size, self.size, 3])
-                for _ in range(40)
+                tf.random_crop(image, [self.size, self.size, 4])
+                for _ in range(20)
             ])
             #return tf.data.Dataset.from_tensor_slices(
             #    tf.reshape(
@@ -106,8 +106,8 @@ class GANSuperResolution:
         self.lanczos3_horizontal = tf.constant(
             [
                 [[
-                    [a if o == i else 0 for o in range(3)]
-                    for i in range(3)
+                    [a if o == i else 0 for o in range(4)]
+                    for i in range(4)
                 ]] 
                 for a in lanczos3
             ]
@@ -115,8 +115,8 @@ class GANSuperResolution:
         self.lanczos3_vertical = tf.constant(
             [[
                 [
-                    [a if o == i else 0 for o in range(3)]
-                    for i in range(3)
+                    [a if o == i else 0 for o in range(4)]
+                    for i in range(4)
                 ]
                 for a in lanczos3
             ]]
@@ -131,38 +131,11 @@ class GANSuperResolution:
         iterator = d.make_one_shot_iterator()
         self.real = iterator.get_next()
         
-        #self.moments = tf.nn.moments(
-        #    self.preprocess(self.real), [0, 1, 2]
-        #)
-        #self.moments = tf.stack([
-        #    self.moments[0], tf.sqrt(self.moments[1])
-        #])
-        
-        #moments, error1, error2 = self.session.run([
-        #    self.moments,
-        #    tf.reduce_mean(tf.abs(
-        #        tf.to_float(self.real) -
-        #        tf.to_float(self.xyz2srgb(self.srgb2xyz(self.real)))
-        #    )),
-        #    tf.reduce_mean(tf.abs(
-        #        tf.to_float(self.srgb2xyz(self.real)) -
-        #        tf.to_float(self.lab2xyz(self.preprocess(self.real)))
-        #    ))
-        #])
-        #print(moments, "error:", error1, error2)
-        #return
-        
-        #real = self.srgb2xyz(self.real)
-        real = tf.to_float(self.real) / 255
+        real = self.srgb2xyz(self.real)
         downscaled = self.lanczos3_downscale(real)
         #downscaled = tamper(downscaled)
         
-        # quantization
-        #downscaled = self.srgb2xyz(self.xyz2srgb(downscaled))
-        
-        self.downscaled = tf.to_int32(tf.minimum(tf.maximum(
-            downscaled * 255, 0
-        ), 255))
+        self.downscaled = self.xyz2srgb(downscaled)
         self.nearest_neighbor = tf.image.resize_nearest_neighbor(
             self.downscaled, [self.size] * 2
         )
@@ -170,9 +143,7 @@ class GANSuperResolution:
         scaled = self.scale(downscaled)
         
         #self.cleaned = self.xyz2srgb(cleaned)
-        self.scaled = tf.to_int32(tf.minimum(tf.maximum(
-            scaled * 255, 0
-        ), 255))
+        self.scaled = self.xyz2srgb(scaled)
         
         redownscaled = self.lanczos3_downscale(scaled, "VALID")
         #self.redownscaled = self.xyz2srgb(redownscaled)
@@ -339,12 +310,12 @@ class GANSuperResolution:
             ], -1
         )
         
-    def xyz2srgb(self, c):
-        c, alpha = tf.split(c, [3, 1], -1)
+    def xyz2srgb(self, xyza):
+        xyz, alpha = tf.split(xyza, [3, 1], -1)
         linear = (
-            c * [[[[3.2404542, -0.9692660, 0.0556434]]]] +
-            c * [[[[-1.5371385, 1.8760108, -0.2040259]]]] +
-            c * [[[[-0.4985314, 0.0415560, 1.0572252]]]]
+            xyz * [[[[3.2404542, -0.9692660, 0.0556434]]]] +
+            xyz * [[[[-1.5371385, 1.8760108, -0.2040259]]]] +
+            xyz * [[[[-0.4985314, 0.0415560, 1.0572252]]]]
         )
         srgb = tf.where(
             linear <= 0.003131,
@@ -431,7 +402,7 @@ class GANSuperResolution:
                 ))
             
             x = tf.nn.selu(tf.layers.conv2d(
-                x, 3,
+                x, 4,
                 [1, 1], [1, 1], 'same', name = 'dense_final'
             ))
 
@@ -484,7 +455,7 @@ class GANSuperResolution:
                     x, 128,
                     [1, 1], [1, 1], 'same', name = 'dense_1_' + str(i)
                 ))
-                
+
                 result += [tf.layers.conv2d(
                     x, 1, [1, 1], [1, 1], 'same', 
                     name = 'dense_result_1_' + str(i)
