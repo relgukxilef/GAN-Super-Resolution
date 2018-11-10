@@ -28,7 +28,7 @@ class GANSuperResolution:
     def __init__(
         self, session, continue_train = True, 
         learning_rate = 1e-5,
-        batch_size = 2
+        batch_size = 4
     ):
         self.session = session
         self.learning_rate = learning_rate
@@ -182,7 +182,7 @@ class GANSuperResolution:
             )), # non-saturating GAN
             #tf.reduce_mean((fake_logits - 0.5)**2),
             #self.rescale_loss,
-            tf.reduce_mean(tf.abs(real - scaled))
+            #tf.reduce_mean(tf.abs(real - scaled))
         ])
         self.d_loss = sum([
             tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
@@ -293,7 +293,7 @@ class GANSuperResolution:
         return result
             
     def srgb2xyz(self, c):
-        c = tf.cast(c, tf.float32) / 255
+        c = (tf.cast(c, tf.float32) + tf.random_uniform(tf.shape(c))) / 256
         c, alpha = tf.split(c, [3, 1], -1)
         c = c * alpha # pre-multiply
         linear = tf.where(
@@ -323,10 +323,10 @@ class GANSuperResolution:
             1.055 * linear**(1 / 2.4) - 0.055
         )
         #srgb = nice_power(linear, 1 / 2.4, 0.003131, 2) - 0.055
-        srgb = srgb / tf.maximum(alpha, 1 / 255)
+        srgb = srgb / tf.maximum(alpha, 1 / 256)
         srgb = tf.concat([srgb, alpha], -1)
         return tf.cast(tf.minimum(tf.maximum(
-            srgb * 255, 0
+            srgb * 256, 0
         ), 255), tf.int32)
         
     def xyz2lab(self, c):
@@ -432,7 +432,7 @@ class GANSuperResolution:
             
             x = small_images
             
-            for i in range(4):
+            for i in range(2):
                 x = tf.nn.selu(tf.layers.conv2d(
                     x, 64, [3, 3], [1, 1], 'same', name = 'conv3x3_0_' + str(i)
                 ))
@@ -446,11 +446,7 @@ class GANSuperResolution:
 
             x = tf.concat([large_images, x], -1)
             
-            for i in range(2):
-                x = tf.nn.selu(tf.layers.conv2d(
-                    x, 128, 
-                    [3, 3], [1, 1], 'same', name = 'conv3x3_1_' + str(i)
-                ))
+            for i in range(4):
                 x = tf.nn.selu(tf.layers.conv2d(
                     x, 128,
                     [1, 1], [1, 1], 'same', name = 'dense_1_' + str(i)
@@ -460,6 +456,11 @@ class GANSuperResolution:
                     x, 1, [1, 1], [1, 1], 'same', 
                     name = 'dense_result_1_' + str(i)
                 )]
+                
+                x = tf.nn.selu(tf.layers.conv2d(
+                    x, 128, 
+                    [3, 3], [1, 1], 'same', name = 'conv3x3_1_' + str(i)
+                ))
             
             return tf.concat(result, -1)
  
