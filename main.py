@@ -12,7 +12,9 @@ args = parser.parse_args()
 def main(_):
     tf.reset_default_graph()
 
-    with tf.Session() as session:
+    gpu_options = tf.GPUOptions(per_process_gpu_memory_fraction=0.5)
+
+    with tf.Session(config=tf.ConfigProto(gpu_options=gpu_options)) as session:
         model = GANSuperResolution(session)
         model.train() if args.phase == 'train' else model.scale_file(args.i)
 

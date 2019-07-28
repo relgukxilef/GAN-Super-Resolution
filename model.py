@@ -1,5 +1,5 @@
 import numpy as np
-import scipy.misc as scm
+import imageio
 import tensorflow as tf
 import os
 
@@ -27,16 +27,15 @@ def nice_power(x, n, s, e):
 class GANSuperResolution:
     def __init__(
         self, session, continue_train = True, 
-        learning_rate = 1e-5,
-        batch_size = 4
+        learning_rate = 1e-3,
+        batch_size = 16
     ):
         self.session = session
         self.learning_rate = learning_rate
         self.batch_size = batch_size
         self.continue_train = continue_train
-        self.filters = 64
-        self.max_filters = 128
-        self.dimensions = 32
+        self.g_filters = 128
+        self.d_filters = 128
         self.checkpoint_path = "checkpoints"
         self.size = 64
         
@@ -48,54 +47,7 @@ class GANSuperResolution:
                     
         def load(path):
             image = tf.image.decode_image(tf.read_file(path), 4)
-            return tf.data.Dataset.from_tensor_slices([
-                tf.random_crop(image, [self.size, self.size, 4])
-                for _ in range(20)
-            ])
-            #return tf.data.Dataset.from_tensor_slices(
-            #    tf.reshape(
-            #        tf.extract_image_patches(
-            #            [tf.image.decode_image(tf.read_file(path), 3)],
-            #            [1, self.size * 2, self.size * 2, 1], 
-            #            [1, self.size // 1, self.size // 1, 1], 
-            #            [1, 1, 1, 1], "VALID"
-            #        ),
-            #        [-1, self.size * 2, self.size * 2, 3]
-            #    )
-            #)
-            
-        def tamper(images_xyz):
-            # operates on batches
-            # apply random blurring or sharpening
-            blur = [0.157731, 0.684538, 0.157731]
-            blur_kernel = tf.constant(
-                [[[[a * b] for c in range(3)] for a in blur] for b in blur]
-            )
-            
-            blurred = tf.nn.depthwise_conv2d(
-                images_xyz, blur_kernel, [1, 1, 1, 1], "SAME"
-            )
-            ratio = tf.random_uniform([self.batch_size, 1, 1, 1], 0, 1.5)
-            images_xyz = ratio * images_xyz + (1 - ratio) * blurred
-            
-            return images_xyz
-            
-            images_srgb = tf.cast(self.xyz2srgb(images_xyz), tf.uint8)
-            
-            # apply jpg compression
-            jpeg_srgb = tf.convert_to_tensor([
-                tf.reshape(tf.image.decode_jpeg(tf.image.encode_jpeg(
-                    images_srgb[i, :, :, :3],
-                    quality = 50
-                ), 3), [self.size // 2, self.size // 2, 3])
-                for i in range(self.batch_size)
-            ])
-            jpeg_srgb = tf.pad(jpeg_srgb, [[0, 0], [0, 0], [0, 0], [0, 1]])
-            jpeg_xyz = self.srgb2xyz(jpeg_srgb)
-            
-            return tf.where(
-                tf.random_uniform([self.batch_size]) < 0.5, jpeg_xyz, images_xyz
-            )
+            return tf.random_crop(image, [self.size + 10, self.size + 10, 4])
             
             
         lanczos3 = [
@@ -124,122 +76,126 @@ class GANSuperResolution:
         
         d = tf.data.Dataset.from_tensor_slices(tf.constant(self.paths))
         d = d.shuffle(100000).repeat()
-        d = d.flat_map(load).shuffle(2000)
-        d = d.batch(self.batch_size).prefetch(16)
+        d = d.map(load)
+        d = d.batch(self.batch_size).prefetch(100)
         
         
         iterator = d.make_one_shot_iterator()
         self.real = iterator.get_next()
         
         real = self.srgb2xyz(self.real)
-        downscaled = self.lanczos3_downscale(real)
-        #downscaled = tamper(downscaled)
-        
+        downscaled = self.lanczos3_downscale(real, "VALID")
+
+        # remove padding
+        real = real[:, 5:-5, 5:-5, :]
+        self.real = self.real[:, 5:-5, 5:-5, :]
+
+        #downscaled += tf.random_normal(tf.shape(downscaled)) * 0.01
         self.downscaled = self.xyz2srgb(downscaled)
+
+        self.tampered = tf.concat(
+            [
+                tf.map_fn(
+                    lambda x: tf.image.random_jpeg_quality(x, 80, 100),
+                    self.downscaled[:, :, :, :3]
+                ),
+                self.downscaled[:, :, :, 3:4] # keep alpha channel
+            ], -1
+        )
+        tampered = self.srgb2xyz(self.tampered)
+        
         self.nearest_neighbor = tf.image.resize_nearest_neighbor(
             self.downscaled, [self.size] * 2
         )
         
         scaled = self.scale(downscaled)
         
-        #self.cleaned = self.xyz2srgb(cleaned)
         self.scaled = self.xyz2srgb(scaled)
         
-        redownscaled = self.lanczos3_downscale(scaled, "VALID")
-        #self.redownscaled = self.xyz2srgb(redownscaled)
-        
         # losses
-        fake_logits = self.discriminate(
-            scaled, downscaled
-            #self.xyz2lab(scaled), downscaled
+        fake_logits = self.discriminate(scaled, downscaled)
+        real_logits = self.discriminate(real, downscaled)
+
+        self.fake_probability, self.fake_variance = tf.nn.moments(
+            tf.nn.sigmoid(fake_logits), [0, 1, 2, 3]
         )
-        real_logits = self.discriminate(
-            real, downscaled
-            #self.xyz2lab(real), downscaled
+        self.fake_deviation = tf.sqrt(self.fake_variance)
+        self.real_probability, self.real_variance = tf.nn.moments(
+            tf.nn.sigmoid(real_logits), [0, 1, 2, 3]
         )
+        self.real_deviation = tf.sqrt(self.real_variance)
         
-        def visual_difference(real, fake):
-            return tf.reduce_mean((
-                #self.xyz2lab(real) - self.xyz2lab(fake)
-                nice_power(real, 1/3, 1e-2, 1) - nice_power(fake, 1/3, 1e-2, 1)
-            )**2)
-        
-        self.distance = (
-            tf.reduce_mean(fake_logits) - tf.reduce_mean(real_logits)
+        self.accuracy = 100 * 0.5 * (
+            1 - tf.reduce_mean(tf.nn.sigmoid(fake_logits)) + 
+            tf.reduce_mean(tf.nn.sigmoid(real_logits))
         )
-        
-        self.rescale_loss = tf.reduce_mean(tf.abs(
-            self.lanczos3_downscale(real, "VALID") - 
-            redownscaled
-        ))
-        
-        median_loss = tf.reduce_mean((real - scaled)**2)
-        #median_loss = visual_difference(real, scaled)
+
+        # blind AB test
+        choice_logits = real_logits - fake_logits
+
+        self.choice_accuracy, self.choice_variance = tf.nn.moments(
+            tf.nn.sigmoid(choice_logits), [0, 1, 2, 3]
+        )
+        self.choice_deviation = tf.sqrt(self.choice_variance)
         
         self.g_loss = sum([
             tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
                 logits = fake_logits, labels = tf.ones_like(fake_logits)
             )), # non-saturating GAN
-            #tf.reduce_mean((fake_logits - 0.5)**2),
-            #self.rescale_loss,
+            #tf.reduce_mean(tf.squared_difference(real, scaled))
             #tf.reduce_mean(tf.abs(real - scaled))
         ])
         self.d_loss = sum([
             tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
-                logits = real_logits, labels = tf.ones_like(real_logits)
-            )),
-            tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
                 logits = fake_logits, labels = tf.zeros_like(fake_logits)
             )), 
-            #tf.reduce_mean((real_logits - 0.5)**2),
-            #tf.reduce_mean((fake_logits + 0.5)**2),
+            tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
+                logits = real_logits, labels = tf.ones_like(real_logits)
+            )), 
         ])
         
         variables = tf.trainable_variables()
         g_variables = [v for v in variables if 'discriminate' not in v.name]
         d_variables = [v for v in variables if 'discriminate' in v.name]
         
-        # Adam learning rate 
-        #learning_rate = self.learning_rate / ( 
-        #    tf.to_float(self.global_step) / 1e5 + 1 
-        #)**0.5
-        learning_rate = self.learning_rate
+        optimizer = tf.train.GradientDescentOptimizer(self.learning_rate)
+        #optimizer = tf.train.AdamOptimizer(1e-4, 0.0)
+        #optimizer = tf.train.MomentumOptimizer(learning_rate, 0.9, use_nesterov = True)
+        #optimizer = tf.contrib.opt.AddSignOptimizer()
         
-        self.g_optimizer = tf.train.AdamOptimizer(
-            learning_rate#, 0.5, 0.9#, use_nesterov = True#, beta1 = 0.5#, beta2 = 0.9
-        ).minimize(
+        self.g_optimizer = optimizer.minimize(
             self.g_loss, self.global_step, var_list = g_variables
         )
 
-        self.d_optimizer = tf.train.AdamOptimizer(
-            learning_rate#, 0.5, 0.9#, use_nesterov = True#, beta1 = 0.5#, beta2 = 0.9
-            #epsilon = 1e-2
-        ).minimize(
+        self.d_optimizer = optimizer.minimize(
             self.d_loss, var_list = d_variables
         )
         
-        
-        #with tf.variable_scope('average'): 
-        #    exponentialAverages = tf.train.ExponentialMovingAverage(0.995) 
-        #    with tf.control_dependencies([self.g_optimizer]):
-        #        self.g_optimizer = exponentialAverages.apply([ 
-        #            self.g_loss, self.d_loss, self.distance, median_loss
-        #        ])
-        #        
-        #        self.g_loss = exponentialAverages.average(self.g_loss) 
-        #        self.d_loss = exponentialAverages.average(self.d_loss) 
-        #        self.distance = exponentialAverages.average(self.distance)
-        #        median_loss = exponentialAverages.average(median_loss)
-        
-
         self.saver = tf.train.Saver(max_to_keep = 2)
+
+
+        example_path = "example.png"
+        example = self.xyz2srgb(self.scale(
+            self.srgb2xyz([tf.random_crop(
+                tf.image.decode_image(tf.read_file(example_path), 4), 
+                [175, 175, 4]
+            )])
+        ))
+        
         
         tf.summary.scalar('generator loss', self.g_loss)
         tf.summary.scalar('discriminator loss', self.d_loss)
-        tf.summary.scalar('distance', self.distance)
-        tf.summary.scalar('median_loss', median_loss)
         tf.summary.histogram('fake score', fake_logits)
         tf.summary.histogram('real score', real_logits)
+        tf.summary.image(
+            'kernel', 
+            tf.transpose(
+                tf.trainable_variables("transform/deconv0/kernel")[0], 
+                [2, 0, 1, 3]
+            ),
+            48
+        )
+        tf.summary.image('example', example)
         
         self.summary_writer = tf.summary.FileWriter('logs', self.session.graph)
         self.summary = tf.summary.merge_all()
@@ -306,7 +262,7 @@ class GANSuperResolution:
                 linear * [[[[0.4124564, 0.2126729, 0.0193339]]]] +
                 linear * [[[[0.3575761, 0.7151522, 0.1191920]]]] +
                 linear * [[[[0.1804375, 0.0721750, 0.9503041]]]],
-                tf.ones_like(alpha)
+                alpha
             ], -1
         )
         
@@ -327,142 +283,52 @@ class GANSuperResolution:
         srgb = tf.concat([srgb, alpha], -1)
         return tf.cast(tf.minimum(tf.maximum(
             srgb * 256, 0
-        ), 255), tf.int32)
-        
-    def xyz2lab(self, c):
-        xyz, alpha = tf.split(c, [3, 1], -1)
-        # https://en.wikipedia.org/wiki/Lab_color_space
-        def f(t):
-            return nice_power(t, 1 / 3, 6**3 / 29**3, 1)
-        x, y, z = (xyz[:, :, :, i] for i in range(3))
-        x_n, y_n, z_n = 0.9505, 1.00, 1.089
-        lab = tf.stack(
-            [
-                1.16 * f(y / y_n) - 0.16,
-                5.00 * (f(x / x_n) - f(y / y_n)),
-                2.00 * (f(y / y_n) - f(z / z_n))
-            ],
-            -1
-        )
-        return tf.concat([lab, alpha], -1)
+        ), 255), tf.uint8)
 
-    def lab2xyz(self, c):
-        # denormalize
-        lab, alpha = tf.split(c, [3, 1], -1)
-        
-        # https://en.wikipedia.org/wiki/Lab_color_space
-        def f(t):
-            return nice_power(t, 3, 6 / 29, 1)
-        l, a, b = (lab[:, :, :, i] for i in range(3))
-        #l = tf.maximum(l, 0)
-        x_n, y_n, z_n = 0.9505, 1.00, 1.089
-        l2 = (l + 0.16) / 1.16
-        xyz = tf.stack([
-            x_n * f(l2 + a / 5.00),
-            y_n * f(l2),
-            z_n * f(l2 - b / 2.00)
-        ], -1)
-        return tf.concat([xyz, alpha], -1)
-    
-    def preprocess(self, images):
-        #return self.srgb2xyz(images)
-        return self.xyz2lab(self.srgb2xyz(images))
-        
-    def postprocess(self, images):
-        #return self.xyz2srgb(images)
-        return self.xyz2srgb(self.lab2xyz(images))
-    
-    def decode(self, image):
+    def scale(self, image):
         with tf.variable_scope(
             'transform', reuse = tf.AUTO_REUSE
         ):
-            x = image
-            
-            for i in range(4):
-                x = tf.nn.selu(tf.layers.conv2d(
-                    x, 64,
-                    [3, 3], [1, 1], 'same', name = 'conv3x3_0_' + str(i)
-                ))
-                x = tf.nn.selu(tf.layers.conv2d(
-                    x, 64,
-                    [1, 1], [1, 1], 'same', name = 'dense_0_' + str(i)
-                ))
-            
-            x = tf.layers.conv2d_transpose(x, 64, [2, 2], [2, 2], 'same', name = 'deconv2x2')
-            x = tf.layers.average_pooling2d(x, [2, 2], [1, 1], 'same') * 2
+            x = image * 2 - 1
 
-            for i in range(1):
-                x = tf.nn.selu(tf.layers.conv2d(
-                    x, 64,
-                    [3, 3], [1, 1], 'same', name = 'conv3x3_1_' + str(i)
-                ))
-                x = tf.nn.selu(tf.layers.conv2d(
-                    x, 64,
-                    [1, 1], [1, 1], 'same', name = 'dense_1_' + str(i)
-                ))
-            
-            x = tf.nn.selu(tf.layers.conv2d(
-                x, 4,
-                [1, 1], [1, 1], 'same', name = 'dense_final'
-            ))
+            x = tf.layers.conv2d_transpose(
+                x, 48,
+                [18, 18], [2, 2], 'same', name = 'deconv0', use_bias = False
+            )
+            x = tf.layers.dense(
+                x, self.g_filters, name = 'dense0'
+            )
 
-            return x
+            x = tf.nn.relu(x)
             
-    def scale(self, images):
-        with tf.variable_scope(
-            'scale', reuse = tf.AUTO_REUSE
-        ):
-            x = self.decode(images * 2 - 1)
-            
-            #x = tf.pad(
-            #    x,
-            #    [[0, 0], [0, 0], [0, 0], [0, 1]], constant_values = 1.0
-            #)
-            
-            return x * 0.5 + 0.5
+            sample = tf.layers.dense(
+                x, 4, name = 'dense1'
+            ) * 0.5 + 0.5
+
+            return sample
             
     def discriminate(self, large_images, small_images):
         with tf.variable_scope(
             'discriminate', reuse = tf.AUTO_REUSE
         ):
-            small_images = small_images * 2 - 1
             large_images = large_images * 2 - 1
-            
-            result = []
-            
-            x = small_images
-            
-            for i in range(2):
-                x = tf.nn.selu(tf.layers.conv2d(
-                    x, 64, [3, 3], [1, 1], 'same', name = 'conv3x3_0_' + str(i)
-                ))
-                x = tf.nn.selu(tf.layers.conv2d(
-                    x, 64,
-                    [1, 1], [1, 1], 'same', name = 'dense_0_' + str(i)
-                ))
-            
-            x = tf.layers.conv2d_transpose(x, 64, [2, 2], [2, 2], 'same', name = 'deconv2x2')
-            x = tf.nn.selu(tf.layers.average_pooling2d(x, [2, 2], [1, 1], 'same') * 2)
+            small_images = small_images * 2 - 1
 
-            x = tf.concat([large_images, x], -1)
+            x = tf.layers.conv2d(
+                large_images, self.g_filters,
+                [9, 9], [1, 1], 'same', name = 'conv0'#, use_bias = False
+            )
+            #x = tf.layers.dense(
+            #    x, self.g_filters, name = 'dense0'
+            #)
             
-            for i in range(4):
-                x = tf.nn.selu(tf.layers.conv2d(
-                    x, 128,
-                    [1, 1], [1, 1], 'same', name = 'dense_1_' + str(i)
-                ))
+            x = tf.nn.relu(x)
+            
+            x = tf.layers.dense(
+                tf.reduce_mean(x, [-2, -3], True), 1, name = 'dense1'
+            )
 
-                result += [tf.layers.conv2d(
-                    x, 1, [1, 1], [1, 1], 'same', 
-                    name = 'dense_result_1_' + str(i)
-                )]
-                
-                x = tf.nn.selu(tf.layers.conv2d(
-                    x, 128, 
-                    [3, 3], [1, 1], 'same', name = 'conv3x3_1_' + str(i)
-                ))
-            
-            return tf.concat(result, -1)
+            return x
  
     def train(self):
         step = self.session.run(self.global_step)
@@ -470,44 +336,10 @@ class GANSuperResolution:
         while True:
             while True:
                 try:
-                    real, scaled, nearest_neighbor, \
-                    g_loss, d_loss, distance, rescale_loss, summary = \
-                        self.session.run([
-                            self.real,
-                            self.scaled,
-                            self.nearest_neighbor,
-                            self.g_loss, self.d_loss, 
-                            self.distance, self.rescale_loss,
-                            self.summary
-                        ])
+                    summary = self.session.run(self.summary)
                     break
                 except tf.errors.InvalidArgumentError as e:
                     print(e.message)
-                
-            print(
-                (
-                    "#{}, g_loss: {:.4f}, rescale_loss: {:.4f}, " + 
-                    "d_loss: {:.4f}, distance: {:.4f}"
-                ).format(step, g_loss, rescale_loss, d_loss, distance)
-            )
-            
-            #scaled_distribution[
-            #    :, :redownscaled.shape[1], :redownscaled.shape[2], :
-            #] = redownscaled
-
-            i = np.concatenate(
-                (
-                    nearest_neighbor,
-                    scaled,
-                    real,
-                ),
-                axis = 2
-            )
-            i = np.concatenate(
-                [np.squeeze(x, 0) for x in np.split(i, i.shape[0])]
-            )
-
-            scm.imsave("samples/{}.png".format(step) , i)
         
             self.summary_writer.add_summary(summary, step)
                 
@@ -525,7 +357,7 @@ class GANSuperResolution:
                     except tf.errors.InvalidArgumentError as e:
                         print(e.message)
                 
-            if step % 8000 == 0:
+            if step % 16000 == 0:
                 pass
                 print("saving iteration " + str(step))
                 self.saver.save(
@@ -602,6 +434,6 @@ class GANSuperResolution:
             )
         )
 
-        scm.imsave("{}_scaled.png".format(filename), r)
+        imageio.imwrite("{}_scaled.png".format(filename), r)
         
     
