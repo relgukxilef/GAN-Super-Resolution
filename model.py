@@ -43,7 +43,7 @@ class GANSuperResolution:
 
         # build model
         print("lookup training data...")
-        self.paths = glob("data/half/*.png")
+        self.paths = glob("data/cropped/*.png")
                     
         def load(path):
             image = tf.image.decode_image(tf.read_file(path), 4)
