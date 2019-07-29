@@ -7,22 +7,22 @@ from math import floor, sin, pi
 from glob import glob
 from tqdm import tqdm
 
-def nice_power(x, n, s, e):
-    sa = n * s**(n - 1)
-    ea = n * e**(n - 1)
-    
-    sb = s**n - sa * s
-    eb = e**n - ea * e
-    
-    return tf.where(
-        x < s,
-        sa * x + sb,
-        tf.where(
-            x > e,
-            ea * x + eb,
-            tf.maximum(tf.minimum(x, e), s)**n
-        )
+@tf.custom_gradient
+def quantize(latent, codebook):
+    # x     batch * width * height *        latent
+    # c                              code * latent
+    # r     batch * width * height * code
+
+    index = tf.argmin(
+        tf.reduce_sum((tf.expand_dims(latent, -2) - codebook)**2, [-1]), -1
     )
+    code = tf.gather(codebook, index)
+    quantized = code
+
+    def grad(d_quantized, d_code):
+        return d_quantized, tf.gradients(code, codebook, d_code)
+
+    return [quantized, code], grad
 
 class GANSuperResolution:
     def __init__(
@@ -34,8 +34,7 @@ class GANSuperResolution:
         self.learning_rate = learning_rate
         self.batch_size = batch_size
         self.continue_train = continue_train
-        self.g_filters = 128
-        self.d_filters = 128
+        self.filters = 64
         self.checkpoint_path = "checkpoints"
         self.size = 64
         
@@ -79,7 +78,6 @@ class GANSuperResolution:
         d = d.map(load)
         d = d.batch(self.batch_size).prefetch(100)
         
-        
         iterator = d.make_one_shot_iterator()
         self.real = iterator.get_next()
         
@@ -108,89 +106,62 @@ class GANSuperResolution:
             self.downscaled, [self.size] * 2
         )
         
-        scaled = self.scale(downscaled)
         
-        self.scaled = self.xyz2srgb(scaled)
+        codebook = tf.get_variable(
+            'codebook', [16, 24],
+            initializer = tf.initializers.random_normal()
+        )
+        
+        encoded = self.encode(real)
+        quantized, code = quantize(encoded, codebook)
+        decoded = self.decode(downscaled, quantized)
         
         # losses
-        fake_logits = self.discriminate(scaled, downscaled)
-        real_logits = self.discriminate(real, downscaled)
-
-        self.fake_probability, self.fake_variance = tf.nn.moments(
-            tf.nn.sigmoid(fake_logits), [0, 1, 2, 3]
-        )
-        self.fake_deviation = tf.sqrt(self.fake_variance)
-        self.real_probability, self.real_variance = tf.nn.moments(
-            tf.nn.sigmoid(real_logits), [0, 1, 2, 3]
-        )
-        self.real_deviation = tf.sqrt(self.real_variance)
-        
-        self.accuracy = 100 * 0.5 * (
-            1 - tf.reduce_mean(tf.nn.sigmoid(fake_logits)) + 
-            tf.reduce_mean(tf.nn.sigmoid(real_logits))
-        )
-
-        # blind AB test
-        choice_logits = real_logits - fake_logits
-
-        self.choice_accuracy, self.choice_variance = tf.nn.moments(
-            tf.nn.sigmoid(choice_logits), [0, 1, 2, 3]
-        )
-        self.choice_deviation = tf.sqrt(self.choice_variance)
-        
-        self.g_loss = sum([
-            tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
-                logits = fake_logits, labels = tf.ones_like(fake_logits)
-            )), # non-saturating GAN
-            #tf.reduce_mean(tf.squared_difference(real, scaled))
-            #tf.reduce_mean(tf.abs(real - scaled))
-        ])
-        self.d_loss = sum([
-            tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
-                logits = fake_logits, labels = tf.zeros_like(fake_logits)
-            )), 
-            tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
-                logits = real_logits, labels = tf.ones_like(real_logits)
-            )), 
+        self.loss = sum([
+            tf.reduce_mean(tf.squared_difference(real, decoded)),
+            tf.reduce_mean(tf.squared_difference(tf.stop_gradient(encoded), code)),
+            0.01 * tf.reduce_mean(tf.squared_difference(encoded, tf.stop_gradient(code))),
         ])
         
-        variables = tf.trainable_variables()
-        g_variables = [v for v in variables if 'discriminate' not in v.name]
-        d_variables = [v for v in variables if 'discriminate' in v.name]
-        
-        optimizer = tf.train.GradientDescentOptimizer(self.learning_rate)
-        #optimizer = tf.train.AdamOptimizer(1e-4, 0.0)
+        #optimizer = tf.train.GradientDescentOptimizer(self.learning_rate)
+        optimizer = tf.train.AdamOptimizer()
         #optimizer = tf.train.MomentumOptimizer(learning_rate, 0.9, use_nesterov = True)
         #optimizer = tf.contrib.opt.AddSignOptimizer()
         
-        self.g_optimizer = optimizer.minimize(
-            self.g_loss, self.global_step, var_list = g_variables
-        )
-
-        self.d_optimizer = optimizer.minimize(
-            self.d_loss, var_list = d_variables
-        )
+        self.optimizer = optimizer.minimize(self.loss, self.global_step)
         
         self.saver = tf.train.Saver(max_to_keep = 2)
 
 
         example_path = "example.png"
-        example = self.xyz2srgb(self.scale(
-            self.srgb2xyz([tf.random_crop(
-                tf.image.decode_image(tf.read_file(example_path), 4), 
-                [175, 175, 4]
-            )])
+        example = self.srgb2xyz([tf.random_crop(
+            tf.image.decode_image(tf.read_file(example_path), 4), 
+            [175, 175, 4]
+        )])
+        example = self.xyz2srgb(self.decode(
+            example, 
+            tf.gather(
+                codebook, 
+                tf.random_uniform(
+                    example.shape[:-1], 0, codebook.shape[0], tf.int32
+                )
+            )
         ))
         
         
-        tf.summary.scalar('generator loss', self.g_loss)
-        tf.summary.scalar('discriminator loss', self.d_loss)
-        tf.summary.histogram('fake score', fake_logits)
-        tf.summary.histogram('real score', real_logits)
+        tf.summary.scalar('loss', self.loss)
+        tf.summary.scalar(
+            'latent variance', 
+            tf.reduce_mean(tf.sqrt(tf.nn.moments(encoded, [0, 1, 2])[1]))
+        )
+        tf.summary.scalar(
+            'code book variance', 
+            tf.reduce_mean(tf.sqrt(tf.nn.moments(codebook, [0])[1]))
+        )
         tf.summary.image(
             'kernel', 
             tf.transpose(
-                tf.trainable_variables("transform/deconv0/kernel")[0], 
+                tf.trainable_variables("transform/deconv0/kernel")[0][:, :, :, :3], 
                 [2, 0, 1, 3]
             ),
             48
@@ -285,18 +256,20 @@ class GANSuperResolution:
             srgb * 256, 0
         ), 255), tf.uint8)
 
-    def scale(self, image):
+    def decode(self, small_images, latent):
         with tf.variable_scope(
             'transform', reuse = tf.AUTO_REUSE
         ):
-            x = image * 2 - 1
+            x = small_images * 2 - 1
+
+            x = tf.concat([x, latent], -1)
 
             x = tf.layers.conv2d_transpose(
                 x, 48,
-                [18, 18], [2, 2], 'same', name = 'deconv0', use_bias = False
+                [16, 16], [2, 2], 'same', name = 'deconv0', use_bias = False
             )
             x = tf.layers.dense(
-                x, self.g_filters, name = 'dense0'
+                x, self.filters, name = 'dense0'
             )
 
             x = tf.nn.relu(x)
@@ -307,26 +280,23 @@ class GANSuperResolution:
 
             return sample
             
-    def discriminate(self, large_images, small_images):
+    def encode(self, large_images):
         with tf.variable_scope(
             'discriminate', reuse = tf.AUTO_REUSE
         ):
             large_images = large_images * 2 - 1
-            small_images = small_images * 2 - 1
 
             x = tf.layers.conv2d(
-                large_images, self.g_filters,
-                [9, 9], [1, 1], 'same', name = 'conv0'#, use_bias = False
+                large_images, 48,
+                [8, 8], [2, 2], 'same', name = 'conv0'#, use_bias = False
             )
-            #x = tf.layers.dense(
-            #    x, self.g_filters, name = 'dense0'
-            #)
+            x = tf.layers.dense(
+                x, self.filters, name = 'dense0'
+            )
             
             x = tf.nn.relu(x)
             
-            x = tf.layers.dense(
-                tf.reduce_mean(x, [-2, -3], True), 1, name = 'dense1'
-            )
+            x = tf.layers.dense(x, 24, name = 'dense1')
 
             return x
  
@@ -348,8 +318,7 @@ class GANSuperResolution:
                     try:
                         _, step = self.session.run([
                             [
-                                self.d_optimizer, 
-                                self.g_optimizer
+                                self.optimizer
                             ],
                             self.global_step
                         ])
