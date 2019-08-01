@@ -7,40 +7,24 @@ from math import floor, sin, pi
 from glob import glob
 from tqdm import tqdm
 
-@tf.custom_gradient
-def quantize(latent, codebook):
-    # x     batch * width * height *        latent
-    # c                              code * latent
-    # r     batch * width * height * code
-
-    index = tf.argmin(
-        tf.reduce_sum((tf.expand_dims(latent, -2) - codebook)**2, [-1]), -1
-    )
-    code = tf.gather(codebook, index)
-    quantized = code
-
-    def grad(d_quantized, d_code):
-        return d_quantized, tf.gradients(code, codebook, d_code)
-
-    return [quantized, code], grad
-
 class GANSuperResolution:
     def __init__(
         self, session, continue_train = True, 
-        learning_rate = 1e-3,
-        batch_size = 16
+        learning_rate = 1e-4,
+        batch_size = 32
     ):
         self.session = session
         self.learning_rate = learning_rate
         self.batch_size = batch_size
         self.continue_train = continue_train
-        self.filters = 64
+        self.rank = 128
+        self.filters = 256
         self.checkpoint_path = "checkpoints"
         self.size = 64
+        self.latent_dimensions = 12
         
         self.global_step = tf.Variable(0, name = 'global_step')
 
-        # build model
         print("lookup training data...")
         self.paths = glob("data/cropped/*.png")
                     
@@ -88,7 +72,6 @@ class GANSuperResolution:
         real = real[:, 5:-5, 5:-5, :]
         self.real = self.real[:, 5:-5, 5:-5, :]
 
-        #downscaled += tf.random_normal(tf.shape(downscaled)) * 0.01
         self.downscaled = self.xyz2srgb(downscaled)
 
         self.tampered = tf.concat(
@@ -107,26 +90,19 @@ class GANSuperResolution:
         )
         
         
-        codebook = tf.get_variable(
-            'codebook', [16, 24],
-            initializer = tf.initializers.random_normal()
-        )
-        
         encoded = self.encode(real)
-        quantized, code = quantize(encoded, codebook)
+        quantized = sum([
+            tf.clip_by_value(encoded, -1, 1),
+            tf.random_normal(tf.shape(encoded), 0.0, 0.125)
+        ])
         decoded = self.decode(downscaled, quantized)
         
         # losses
         self.loss = sum([
-            tf.reduce_mean(tf.squared_difference(real, decoded)),
-            tf.reduce_mean(tf.squared_difference(tf.stop_gradient(encoded), code)),
-            0.01 * tf.reduce_mean(tf.squared_difference(encoded, tf.stop_gradient(code))),
+            tf.reduce_mean(tf.abs(real - decoded)),
         ])
         
-        #optimizer = tf.train.GradientDescentOptimizer(self.learning_rate)
-        optimizer = tf.train.AdamOptimizer()
-        #optimizer = tf.train.MomentumOptimizer(learning_rate, 0.9, use_nesterov = True)
-        #optimizer = tf.contrib.opt.AddSignOptimizer()
+        optimizer = tf.train.AdamOptimizer(self.learning_rate)
         
         self.optimizer = optimizer.minimize(self.loss, self.global_step)
         
@@ -138,35 +114,38 @@ class GANSuperResolution:
             tf.image.decode_image(tf.read_file(example_path), 4), 
             [175, 175, 4]
         )])
+        example_latent_size = tf.concat(
+            [example.shape[:-1], [self.latent_dimensions]], -1
+        )
         example = self.xyz2srgb(self.decode(
-            example, 
-            tf.gather(
-                codebook, 
-                tf.random_uniform(
-                    example.shape[:-1], 0, codebook.shape[0], tf.int32
-                )
-            )
+            tf.concat([example, example], 0), 
+            tf.concat([
+                #tf.random_normal(example_latent_size, 0, 0.125) + 
+                tf.random_uniform(example_latent_size, -1, 1),
+                tf.zeros(example_latent_size)
+            ], 0)
         ))
         
         
         tf.summary.scalar('loss', self.loss)
         tf.summary.scalar(
             'latent variance', 
-            tf.reduce_mean(tf.sqrt(tf.nn.moments(encoded, [0, 1, 2])[1]))
-        )
-        tf.summary.scalar(
-            'code book variance', 
-            tf.reduce_mean(tf.sqrt(tf.nn.moments(codebook, [0])[1]))
+            tf.reduce_mean(tf.sqrt(tf.nn.moments(encoded, [1, 2])[1]))
         )
         tf.summary.image(
             'kernel', 
             tf.transpose(
-                tf.trainable_variables("transform/deconv0/kernel")[0][:, :, :, :3], 
-                [2, 0, 1, 3]
-            ),
-            48
+                tf.trainable_variables(
+                    "transform/conv0/kernel"
+                )[0], 
+                [3, 0, 1, 2]
+            )[:, :, :, :3],
+            24
         )
         tf.summary.image('example', example)
+
+        tf.summary.image('decoded', self.xyz2srgb(decoded))
+        tf.summary.image('real', self.xyz2srgb(real))
         
         self.summary_writer = tf.summary.FileWriter('logs', self.session.graph)
         self.summary = tf.summary.merge_all()
@@ -261,34 +240,36 @@ class GANSuperResolution:
             'transform', reuse = tf.AUTO_REUSE
         ):
             x = small_images * 2 - 1
+            y = latent
+            
+            x = tf.concat([x, y], -1)
 
-            x = tf.concat([x, latent], -1)
-
-            x = tf.layers.conv2d_transpose(
-                x, 48,
-                [16, 16], [2, 2], 'same', name = 'deconv0', use_bias = False
+            x = tf.layers.conv2d(
+                x, self.rank,
+                [11, 11], [1, 1], 'same', name = 'conv0', use_bias = False
             )
             x = tf.layers.dense(
                 x, self.filters, name = 'dense0'
             )
 
             x = tf.nn.relu(x)
-            
-            sample = tf.layers.dense(
-                x, 4, name = 'dense1'
-            ) * 0.5 + 0.5
 
-            return sample
+            x = tf.layers.conv2d_transpose(
+                x, 4,
+                [2, 2], [2, 2], 'same', name = 'conv1'
+            )
+
+            return x * 0.5 + 0.5
             
     def encode(self, large_images):
         with tf.variable_scope(
             'discriminate', reuse = tf.AUTO_REUSE
         ):
-            large_images = large_images * 2 - 1
+            x = large_images * 2 - 1
 
             x = tf.layers.conv2d(
-                large_images, 48,
-                [8, 8], [2, 2], 'same', name = 'conv0'#, use_bias = False
+                x, self.rank,
+                [22, 22], [2, 2], 'same', name = 'conv0', use_bias = False
             )
             x = tf.layers.dense(
                 x, self.filters, name = 'dense0'
@@ -296,7 +277,9 @@ class GANSuperResolution:
             
             x = tf.nn.relu(x)
             
-            x = tf.layers.dense(x, 24, name = 'dense1')
+            x = tf.layers.dense(
+                x, self.latent_dimensions, name = 'dense1'
+            )
 
             return x
  
@@ -356,7 +339,7 @@ class GANSuperResolution:
         )
         
         result_tiles = tf.Variable(
-            tf.zeros(tf.shape(tiles) * [1, 2, 2, 1], tf.int32),
+            tf.zeros(tf.shape(tiles) * [1, 2, 2, 1], tf.uint8),
             validate_shape = False
         )
         
@@ -373,9 +356,14 @@ class GANSuperResolution:
         step = tf.scatter_update(
             result_tiles, [index], 
             self.xyz2srgb(
-                self.scale(self.srgb2xyz(
-                    tf.reshape([tiles[index, :, :, :]], [1, 128, 128, 4])
-                ))
+                self.decode(
+                    self.srgb2xyz(
+                        tf.reshape([tiles[index, :, :, :]], [1, 128, 128, 4])
+                    ), 
+                    tf.random_uniform(
+                        [1, 128, 128, self.latent_dimensions], -1, 1
+                    )
+                )
             )
         )
         
