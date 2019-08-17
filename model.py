@@ -27,17 +27,17 @@ def nice_power(x, n, s, e):
 class GANSuperResolution:
     def __init__(
         self, session, continue_train = True, 
-        learning_rate = 1e-3,
-        batch_size = 16
+        learning_rate = 1e-4,
+        batch_size = 8
     ):
         self.session = session
         self.learning_rate = learning_rate
         self.batch_size = batch_size
         self.continue_train = continue_train
-        self.g_filters = 128
-        self.d_filters = 128
+        self.filters = 64
         self.checkpoint_path = "checkpoints"
         self.size = 64
+        self.latent_dimensions = 12
         
         self.global_step = tf.Variable(0, name = 'global_step')
 
@@ -107,8 +107,21 @@ class GANSuperResolution:
         self.nearest_neighbor = tf.image.resize_nearest_neighbor(
             self.downscaled, [self.size] * 2
         )
+
+        codebook = tf.get_variable(
+            'codebook', [512, self.latent_dimensions],
+            initializer = tf.initializers.random_normal()
+        )
         
-        scaled = self.scale(downscaled)
+        scaled = self.scale(
+            downscaled, 
+            tf.gather(
+                codebook, 
+                tf.random_uniform(
+                    tf.shape(downscaled)[:-1], 0, codebook.shape[0], tf.int32
+                )
+            )
+        )
         
         self.scaled = self.xyz2srgb(scaled)
         
@@ -158,8 +171,8 @@ class GANSuperResolution:
         g_variables = [v for v in variables if 'discriminate' not in v.name]
         d_variables = [v for v in variables if 'discriminate' in v.name]
         
-        optimizer = tf.train.GradientDescentOptimizer(self.learning_rate)
-        #optimizer = tf.train.AdamOptimizer(1e-4, 0.0)
+        #optimizer = tf.train.GradientDescentOptimizer(self.learning_rate)
+        optimizer = tf.train.AdamOptimizer(self.learning_rate, 0.0)
         #optimizer = tf.train.MomentumOptimizer(learning_rate, 0.9, use_nesterov = True)
         #optimizer = tf.contrib.opt.AddSignOptimizer()
         
@@ -175,25 +188,37 @@ class GANSuperResolution:
 
 
         example_path = "example.png"
+        example = self.srgb2xyz([tf.random_crop(
+            tf.image.decode_image(tf.read_file(example_path), 4), 
+            [175, 175, 4]
+        )])
         example = self.xyz2srgb(self.scale(
-            self.srgb2xyz([tf.random_crop(
-                tf.image.decode_image(tf.read_file(example_path), 4), 
-                [175, 175, 4]
-            )])
+            example, 
+            tf.gather(
+                codebook, 
+                tf.random_uniform(
+                    tf.shape(example)[:-1], 0, codebook.shape[0], tf.int32
+                )
+            )
         ))
         
         
-        tf.summary.scalar('generator loss', self.g_loss)
-        tf.summary.scalar('discriminator loss', self.d_loss)
-        tf.summary.histogram('fake score', fake_logits)
-        tf.summary.histogram('real score', real_logits)
+        tf.summary.scalar('generator_loss', self.g_loss)
+        tf.summary.scalar('discriminator_loss', self.d_loss)
+        tf.summary.scalar(
+            'code_book_variance', 
+            tf.reduce_mean(tf.sqrt(tf.nn.moments(codebook, [0])[1]))
+        )
+
+        tf.summary.histogram('fake_score', fake_logits)
+        tf.summary.histogram('real_score', real_logits)
         tf.summary.image(
             'kernel', 
             tf.transpose(
-                tf.trainable_variables("transform/deconv0/kernel")[0], 
+                tf.trainable_variables("transform/up_conv/kernel")[0], 
                 [2, 0, 1, 3]
-            ),
-            48
+            )[:, :, :, :3],
+            24
         )
         tf.summary.image('example', example)
         
@@ -249,6 +274,8 @@ class GANSuperResolution:
         return result
             
     def srgb2xyz(self, c):
+        return (tf.cast(c, tf.float32) + tf.random_uniform(tf.shape(c))) / 256
+
         c = (tf.cast(c, tf.float32) + tf.random_uniform(tf.shape(c))) / 256
         c, alpha = tf.split(c, [3, 1], -1)
         c = c * alpha # pre-multiply
@@ -267,6 +294,7 @@ class GANSuperResolution:
         )
         
     def xyz2srgb(self, xyza):
+        return tf.cast(tf.clip_by_value(xyza * 256, 0, 255), tf.uint8)
         xyz, alpha = tf.split(xyza, [3, 1], -1)
         linear = (
             xyz * [[[[3.2404542, -0.9692660, 0.0556434]]]] +
@@ -285,27 +313,24 @@ class GANSuperResolution:
             srgb * 256, 0
         ), 255), tf.uint8)
 
-    def scale(self, image):
+    def scale(self, small_images, latent):
         with tf.variable_scope(
             'transform', reuse = tf.AUTO_REUSE
         ):
-            x = image * 2 - 1
+            x = tf.concat([small_images * 2 - 1, latent], -1)
 
             x = tf.layers.conv2d_transpose(
-                x, 48,
-                [18, 18], [2, 2], 'same', name = 'deconv0', use_bias = False
-            )
-            x = tf.layers.dense(
-                x, self.g_filters, name = 'dense0'
+                x, self.filters,
+                [22, 22], [2, 2], 'same', name = 'up_conv'
             )
 
             x = tf.nn.relu(x)
-            
-            sample = tf.layers.dense(
-                x, 4, name = 'dense1'
-            ) * 0.5 + 0.5
 
-            return sample
+            x = tf.layers.conv2d(
+                x, 4, [11, 11], [1, 1], 'same', name = 'conv0'
+            )
+
+            return x * 0.5 + 0.5
             
     def discriminate(self, large_images, small_images):
         with tf.variable_scope(
@@ -315,17 +340,17 @@ class GANSuperResolution:
             small_images = small_images * 2 - 1
 
             x = tf.layers.conv2d(
-                large_images, self.g_filters,
-                [9, 9], [1, 1], 'same', name = 'conv0'#, use_bias = False
+                large_images, self.filters,
+                [11, 11], [1, 1], 'same', name = 'conv0', use_bias = False
+            ) + tf.layers.conv2d_transpose(
+                small_images, self.filters,
+                [22, 22], [2, 2], 'same', name = 'up_conv'
             )
-            #x = tf.layers.dense(
-            #    x, self.g_filters, name = 'dense0'
-            #)
-            
+
             x = tf.nn.relu(x)
-            
+
             x = tf.layers.dense(
-                tf.reduce_mean(x, [-2, -3], True), 1, name = 'dense1'
+                tf.reduce_mean(x, [-2, -3], True), 1, name = 'dense0'
             )
 
             return x
