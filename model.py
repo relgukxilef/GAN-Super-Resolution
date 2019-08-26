@@ -34,7 +34,8 @@ class GANSuperResolution:
         self.learning_rate = learning_rate
         self.batch_size = batch_size
         self.continue_train = continue_train
-        self.filters = 64
+        self.g_filters = 128
+        self.d_filters = 64
         self.checkpoint_path = "checkpoints"
         self.size = 64
         self.latent_dimensions = 12
@@ -77,7 +78,7 @@ class GANSuperResolution:
         d = tf.data.Dataset.from_tensor_slices(tf.constant(self.paths))
         d = d.shuffle(100000).repeat()
         d = d.map(load)
-        d = d.batch(self.batch_size).prefetch(100)
+        d = d.batch(self.batch_size).prefetch(1000)
         
         
         iterator = d.make_one_shot_iterator()
@@ -165,14 +166,14 @@ class GANSuperResolution:
             tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
                 logits = real_logits, labels = tf.ones_like(real_logits)
             )), 
-        ])
+        ]) * 0.5
         
         variables = tf.trainable_variables()
         g_variables = [v for v in variables if 'discriminate' not in v.name]
         d_variables = [v for v in variables if 'discriminate' in v.name]
         
         #optimizer = tf.train.GradientDescentOptimizer(self.learning_rate)
-        optimizer = tf.train.AdamOptimizer(self.learning_rate, 0.0)
+        optimizer = tf.train.AdamOptimizer(self.learning_rate, 0.5)
         #optimizer = tf.train.MomentumOptimizer(learning_rate, 0.9, use_nesterov = True)
         #optimizer = tf.contrib.opt.AddSignOptimizer()
         
@@ -215,10 +216,10 @@ class GANSuperResolution:
         tf.summary.image(
             'kernel', 
             tf.transpose(
-                tf.trainable_variables("transform/up_conv/kernel")[0], 
-                [2, 0, 1, 3]
+                tf.trainable_variables("transform/conv0/kernel")[0], 
+                [3, 0, 1, 2]
             )[:, :, :, :3],
-            24
+            48
         )
         tf.summary.image('example', example)
         
@@ -318,16 +319,22 @@ class GANSuperResolution:
             'transform', reuse = tf.AUTO_REUSE
         ):
             x = tf.concat([small_images * 2 - 1, latent], -1)
-
-            x = tf.layers.conv2d_transpose(
-                x, self.filters,
-                [22, 22], [2, 2], 'same', name = 'up_conv'
-            )
-
-            x = tf.nn.relu(x)
+            #x = small_images * 2 - 1
 
             x = tf.layers.conv2d(
-                x, 4, [11, 11], [1, 1], 'same', name = 'conv0'
+                x, self.g_filters,
+                [11, 11], [1, 1], 'same', name = 'conv0'
+            )
+
+            x = tf.nn.leaky_relu(x, 1e-3)
+            tf.summary.image(
+                'activation', 
+                tf.transpose(x[0:1, :, :, :], [3, 1, 2, 0]), 48
+            )
+            tf.summary.histogram('activation_h', x)
+
+            x = tf.layers.conv2d_transpose(
+                x, 4, [22, 22], [2, 2], 'same', name = 'up_conv'
             )
 
             return x * 0.5 + 0.5
@@ -340,14 +347,18 @@ class GANSuperResolution:
             small_images = small_images * 2 - 1
 
             x = tf.layers.conv2d(
-                large_images, self.filters,
-                [11, 11], [1, 1], 'same', name = 'conv0', use_bias = False
-            ) + tf.layers.conv2d_transpose(
-                small_images, self.filters,
-                [22, 22], [2, 2], 'same', name = 'up_conv'
+                large_images, self.d_filters,
+                [22, 22], [2, 2], 'same', name = 'down_conv', use_bias = False
+            ) + tf.layers.conv2d(
+                small_images, self.d_filters,
+                [11, 11], [1, 1], 'same', name = 'conv0'
             )
 
-            x = tf.nn.relu(x)
+            x = tf.nn.leaky_relu(x, 1e-3)
+            tf.summary.image(
+                'activation', 
+                tf.transpose(x[0:1, :, :, :], [3, 1, 2, 0]), 48
+            )
 
             x = tf.layers.dense(
                 tf.reduce_mean(x, [-2, -3], True), 1, name = 'dense0'
