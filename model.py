@@ -28,7 +28,7 @@ class GANSuperResolution:
     def __init__(
         self, session, continue_train = True, 
         learning_rate = 1e-3,
-        batch_size = 16
+        batch_size = 128
     ):
         self.session = session
         self.learning_rate = learning_rate
@@ -76,7 +76,7 @@ class GANSuperResolution:
         d = tf.data.Dataset.from_tensor_slices(tf.constant(self.paths))
         d = d.map(load, num_parallel_calls = 16).cache()
         d = d.shuffle(100000).repeat()
-        d = d.batch(self.batch_size).prefetch(100)
+        d = d.batch(self.batch_size).prefetch(10)
         
         iterator = d.make_one_shot_iterator()
         self.real = iterator.get_next()
@@ -108,7 +108,7 @@ class GANSuperResolution:
         
         
         codebook = tf.get_variable(
-            'codebook', [16, 24],
+            'codebook', [32, 24],
             initializer = tf.initializers.random_normal()
         )
         
@@ -161,7 +161,7 @@ class GANSuperResolution:
         tf.summary.image(
             'kernel', 
             tf.transpose(
-                tf.trainable_variables("transform/deconv0/kernel")[0][:, :, :, :3], 
+                tf.trainable_variables("transform/conv/kernel")[0][:, :, :, :3], 
                 [2, 0, 1, 3]
             ),
             48
@@ -220,6 +220,8 @@ class GANSuperResolution:
         return result
             
     def srgb2xyz(self, c):
+        return (tf.cast(c, tf.float32) + tf.random_uniform(tf.shape(c))) / 256
+
         c = (tf.cast(c, tf.float32) + tf.random_uniform(tf.shape(c))) / 256
         c, alpha = tf.split(c, [3, 1], -1)
         c = c * alpha # pre-multiply
@@ -238,6 +240,8 @@ class GANSuperResolution:
         )
         
     def xyz2srgb(self, xyza):
+        return tf.cast(tf.clip_by_value(xyza * 256, 0, 255), tf.uint8)
+
         xyz, alpha = tf.split(xyza, [3, 1], -1)
         linear = (
             xyz * [[[[3.2404542, -0.9692660, 0.0556434]]]] +
@@ -264,39 +268,36 @@ class GANSuperResolution:
 
             x = tf.concat([x, latent], -1)
 
-            x = tf.layers.conv2d_transpose(
-                x, 48,
-                [16, 16], [2, 2], 'same', name = 'deconv0', use_bias = False
-            )
-            x = tf.layers.dense(
-                x, self.filters, name = 'dense0'
+            x = tf.layers.conv2d(
+                x, self.filters,
+                [9, 9], [1, 1], 'same', name = 'conv'
             )
 
-            x = tf.nn.relu(x)
+            x = tf.nn.leaky_relu(x)
             
-            sample = tf.layers.dense(
-                x, 4, name = 'dense1'
-            ) * 0.5 + 0.5
+            x = tf.layers.conv2d_transpose(
+                x, 4, [18, 18], [2, 2], 'same', name = 'up_conv'
+            )
 
-            return sample
+            return x * 0.5 + 0.5
             
     def encode(self, large_images):
         with tf.variable_scope(
             'discriminate', reuse = tf.AUTO_REUSE
         ):
-            large_images = large_images * 2 - 1
+            x = large_images * 2 - 1
 
             x = tf.layers.conv2d(
-                large_images, 48,
-                [8, 8], [2, 2], 'same', name = 'conv0'#, use_bias = False
-            )
-            x = tf.layers.dense(
-                x, self.filters, name = 'dense0'
+                x, self.filters,
+                [18, 18], [2, 2], 'same', name = 'down_conv'
             )
             
-            x = tf.nn.relu(x)
+            x = tf.nn.leaky_relu(x)
             
-            x = tf.layers.dense(x, 24, name = 'dense1')
+            x = tf.layers.conv2d(
+                x, 24,
+                [9, 9], [1, 1], 'same', name = 'conv'
+            )
 
             return x
  
