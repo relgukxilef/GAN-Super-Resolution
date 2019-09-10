@@ -74,8 +74,8 @@ class GANSuperResolution:
         )   
         
         d = tf.data.Dataset.from_tensor_slices(tf.constant(self.paths))
+        d = d.map(load, num_parallel_calls = 16).cache()
         d = d.shuffle(100000).repeat()
-        d = d.map(load)
         d = d.batch(self.batch_size).prefetch(100)
         
         iterator = d.make_one_shot_iterator()
@@ -326,10 +326,8 @@ class GANSuperResolution:
                     except tf.errors.InvalidArgumentError as e:
                         print(e.message)
                 
-            if step % 16000 == 0:
-                pass
-                print("saving iteration " + str(step))
-                self.saver.save(
+            #print("saving iteration " + str(step))
+            self.saver.save(
                     self.session,
                     self.checkpoint_path + "/gansr",
                     global_step=step
