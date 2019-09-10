@@ -12,7 +12,7 @@ args = parser.parse_args()
 def main(_):
     tf.reset_default_graph()
 
-    gpu_options = tf.GPUOptions(per_process_gpu_memory_fraction=0.5)
+    gpu_options = tf.GPUOptions(per_process_gpu_memory_fraction=0.33)
 
     with tf.Session(config=tf.ConfigProto(gpu_options=gpu_options)) as session:
         model = GANSuperResolution(session)

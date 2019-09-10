@@ -28,14 +28,14 @@ class GANSuperResolution:
     def __init__(
         self, session, continue_train = True, 
         learning_rate = 1e-4,
-        batch_size = 8
+        batch_size = 128
     ):
         self.session = session
         self.learning_rate = learning_rate
         self.batch_size = batch_size
         self.continue_train = continue_train
         self.g_filters = 128
-        self.d_filters = 64
+        self.d_filters = 128
         self.checkpoint_path = "checkpoints"
         self.size = 64
         self.latent_dimensions = 12
@@ -166,14 +166,14 @@ class GANSuperResolution:
             tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
                 logits = real_logits, labels = tf.ones_like(real_logits)
             )), 
-        ]) * 0.5
+        ])
         
         variables = tf.trainable_variables()
         g_variables = [v for v in variables if 'discriminate' not in v.name]
         d_variables = [v for v in variables if 'discriminate' in v.name]
         
         #optimizer = tf.train.GradientDescentOptimizer(self.learning_rate)
-        optimizer = tf.train.AdamOptimizer(self.learning_rate, 0.5)
+        optimizer = tf.train.AdamOptimizer(self.learning_rate, 0.0)
         #optimizer = tf.train.MomentumOptimizer(learning_rate, 0.9, use_nesterov = True)
         #optimizer = tf.contrib.opt.AddSignOptimizer()
         
@@ -323,10 +323,10 @@ class GANSuperResolution:
 
             x = tf.layers.conv2d(
                 x, self.g_filters,
-                [11, 11], [1, 1], 'same', name = 'conv0'
+                [9, 9], [1, 1], 'same', name = 'conv0'
             )
 
-            x = tf.nn.leaky_relu(x, 1e-3)
+            x = tf.nn.leaky_relu(x)
             tf.summary.image(
                 'activation', 
                 tf.transpose(x[0:1, :, :, :], [3, 1, 2, 0]), 48
@@ -334,7 +334,7 @@ class GANSuperResolution:
             tf.summary.histogram('activation_h', x)
 
             x = tf.layers.conv2d_transpose(
-                x, 4, [22, 22], [2, 2], 'same', name = 'up_conv'
+                x, 4, [18, 18], [2, 2], 'same', name = 'up_conv'
             )
 
             return x * 0.5 + 0.5
@@ -348,13 +348,13 @@ class GANSuperResolution:
 
             x = tf.layers.conv2d(
                 large_images, self.d_filters,
-                [22, 22], [2, 2], 'same', name = 'down_conv', use_bias = False
+                [18, 18], [2, 2], 'same', name = 'down_conv', use_bias = False
             ) + tf.layers.conv2d(
                 small_images, self.d_filters,
-                [11, 11], [1, 1], 'same', name = 'conv0'
+                [9, 9], [1, 1], 'same', name = 'conv0'
             )
 
-            x = tf.nn.leaky_relu(x, 1e-3)
+            x = tf.nn.leaky_relu(x)
             tf.summary.image(
                 'activation', 
                 tf.transpose(x[0:1, :, :, :], [3, 1, 2, 0]), 48
@@ -395,10 +395,10 @@ class GANSuperResolution:
                 
             #print("saving iteration " + str(step))
             self.saver.save(
-                    self.session,
-                    self.checkpoint_path + "/gansr",
-                    global_step=step
-                )
+                self.session,
+                self.checkpoint_path + "/gansr",
+                global_step=step
+            )
 
     def scale_file(self, filename):
         image = tf.Variable(
