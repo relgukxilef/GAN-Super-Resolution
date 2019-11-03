@@ -27,7 +27,7 @@ def nice_power(x, n, s, e):
 class GANSuperResolution:
     def __init__(
         self, session, continue_train = True, 
-        learning_rate = 1e-4,
+        learning_rate = 5e-5,
         batch_size = 128
     ):
         self.session = session
@@ -296,6 +296,7 @@ class GANSuperResolution:
         
     def xyz2srgb(self, xyza):
         return tf.cast(tf.clip_by_value(xyza * 256, 0, 255), tf.uint8)
+
         xyz, alpha = tf.split(xyza, [3, 1], -1)
         linear = (
             xyz * [[[[3.2404542, -0.9692660, 0.0556434]]]] +
@@ -348,10 +349,10 @@ class GANSuperResolution:
 
             x = tf.layers.conv2d(
                 large_images, self.d_filters,
-                [18, 18], [2, 2], 'same', name = 'down_conv', use_bias = False
+                [18, 18], [2, 2], 'same', name = 'down_conv'
             ) + tf.layers.conv2d(
                 small_images, self.d_filters,
-                [9, 9], [1, 1], 'same', name = 'conv0'
+                [9, 9], [1, 1], 'same', name = 'conv0', use_bias = False
             )
 
             x = tf.nn.leaky_relu(x)
