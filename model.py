@@ -11,14 +11,13 @@ class GANSuperResolution:
     def __init__(
         self, session, continue_train = True, 
         learning_rate = 1e-4,
-        batch_size = 32
+        batch_size = 128
     ):
         self.session = session
         self.learning_rate = learning_rate
         self.batch_size = batch_size
         self.continue_train = continue_train
         self.rank = 128
-        self.filters = 256
         self.checkpoint_path = "checkpoints"
         self.size = 64
         self.latent_dimensions = 12
@@ -27,6 +26,7 @@ class GANSuperResolution:
 
         print("lookup training data...")
         self.paths = glob("data/cropped/*.png")
+        np.random.shuffle(self.paths)
                     
         def load(path):
             image = tf.image.decode_image(tf.read_file(path), 4)
@@ -91,10 +91,9 @@ class GANSuperResolution:
         
         
         encoded = self.encode(real)
-        quantized = sum([
-            tf.clip_by_value(encoded, -1, 1),
-            tf.random_normal(tf.shape(encoded), 0.0, 0.125)
-        ])
+        quantized = tf.clip_by_value(
+            encoded + tf.random_normal(tf.shape(encoded), 0.0, 0.5), -1, 1
+        )
         decoded = self.decode(downscaled, quantized)
         
         # losses
@@ -120,7 +119,6 @@ class GANSuperResolution:
         example = self.xyz2srgb(self.decode(
             tf.concat([example, example], 0), 
             tf.concat([
-                #tf.random_normal(example_latent_size, 0, 0.125) + 
                 tf.random_uniform(example_latent_size, -1, 1),
                 tf.zeros(example_latent_size)
             ], 0)
@@ -246,17 +244,14 @@ class GANSuperResolution:
 
             x = tf.layers.conv2d(
                 x, self.rank,
-                [11, 11], [1, 1], 'same', name = 'conv0', use_bias = False
-            )
-            x = tf.layers.dense(
-                x, self.filters, name = 'dense0'
+                [9, 9], [1, 1], 'same', name = 'conv0'
             )
 
-            x = tf.nn.relu(x)
+            x = tf.nn.leaky_relu(x)
 
             x = tf.layers.conv2d_transpose(
                 x, 4,
-                [2, 2], [2, 2], 'same', name = 'conv1'
+                [18, 18], [2, 2], 'same', name = 'conv1'
             )
 
             return x * 0.5 + 0.5
@@ -269,16 +264,14 @@ class GANSuperResolution:
 
             x = tf.layers.conv2d(
                 x, self.rank,
-                [22, 22], [2, 2], 'same', name = 'conv0', use_bias = False
-            )
-            x = tf.layers.dense(
-                x, self.filters, name = 'dense0'
+                [18, 18], [2, 2], 'same', name = 'conv0'
             )
             
-            x = tf.nn.relu(x)
+            x = tf.nn.leaky_relu(x)
             
-            x = tf.layers.dense(
-                x, self.latent_dimensions, name = 'dense1'
+            x = tf.layers.conv2d(
+                x, self.latent_dimensions,
+                [9, 9], [1, 1], 'same', name = 'conv1'
             )
 
             return x
