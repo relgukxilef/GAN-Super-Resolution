@@ -27,7 +27,7 @@ def quantize(latent, codebook):
 class GANSuperResolution:
     def __init__(
         self, session, continue_train = True, 
-        learning_rate = 1e-3,
+        learning_rate = 1e-5,
         batch_size = 128
     ):
         self.session = session
@@ -43,6 +43,7 @@ class GANSuperResolution:
         # build model
         print("lookup training data...")
         self.paths = glob("data/cropped/*.png")
+        np.random.shuffle(self.paths)
                     
         def load(path):
             image = tf.image.decode_image(tf.read_file(path), 4)
@@ -108,23 +109,24 @@ class GANSuperResolution:
         
         
         codebook = tf.get_variable(
-            'codebook', [32, 24],
-            initializer = tf.initializers.random_normal()
+            'codebook', [32, 12],
+            initializer = tf.initializers.random_uniform(-1, 1)
         )
         
-        encoded = self.encode(real)
+        encoded = tf.clip_by_value(self.encode(real), -1, 1)
         quantized, code = quantize(encoded, codebook)
         decoded = self.decode(downscaled, quantized)
         
         # losses
+        self.color_loss = tf.reduce_mean(tf.squared_difference(real, decoded))
+
         self.loss = sum([
-            tf.reduce_mean(tf.squared_difference(real, decoded)),
+            self.color_loss,
             tf.reduce_mean(tf.squared_difference(tf.stop_gradient(encoded), code)),
-            0.01 * tf.reduce_mean(tf.squared_difference(encoded, tf.stop_gradient(code))),
         ])
         
         #optimizer = tf.train.GradientDescentOptimizer(self.learning_rate)
-        optimizer = tf.train.AdamOptimizer()
+        optimizer = tf.train.AdamOptimizer(self.learning_rate)
         #optimizer = tf.train.MomentumOptimizer(learning_rate, 0.9, use_nesterov = True)
         #optimizer = tf.contrib.opt.AddSignOptimizer()
         
@@ -148,8 +150,8 @@ class GANSuperResolution:
             )
         ))
         
-        
         tf.summary.scalar('loss', self.loss)
+        tf.summary.scalar('color_loss', self.color_loss)
         tf.summary.scalar(
             'latent variance', 
             tf.reduce_mean(tf.sqrt(tf.nn.moments(encoded, [0, 1, 2])[1]))
@@ -295,7 +297,7 @@ class GANSuperResolution:
             x = tf.nn.leaky_relu(x)
             
             x = tf.layers.conv2d(
-                x, 24,
+                x, 12,
                 [9, 9], [1, 1], 'same', name = 'conv'
             )
 
