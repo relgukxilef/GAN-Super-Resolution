@@ -161,9 +161,9 @@ class GANSuperResolution:
         tf.summary.image(
             'kernel', 
             tf.transpose(
-                tf.trainable_variables("transform/conv/kernel")[0][:, :, :, :3], 
-                [2, 0, 1, 3]
-            ),
+                tf.trainable_variables("transform/conv/kernel")[0], 
+                [3, 0, 1, 2]
+            )[:, :, :, :3],
             48
         )
         tf.summary.image('example', example)
