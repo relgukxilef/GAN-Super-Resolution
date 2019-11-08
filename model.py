@@ -136,16 +136,16 @@ class GANSuperResolution:
 
 
         example_path = "example.png"
-        example = self.srgb2xyz([tf.random_crop(
+        example_image = self.srgb2xyz([tf.random_crop(
             tf.image.decode_image(tf.read_file(example_path), 4), 
             [175, 175, 4]
         )])
         example = self.xyz2srgb(self.decode(
-            example, 
+            example_image, 
             tf.gather(
                 codebook, 
                 tf.random_uniform(
-                    example.shape[:-1], 0, codebook.shape[0], tf.int32
+                    example_image.shape[:-1], 0, codebook.shape[0], tf.int32
                 )
             )
         ))
@@ -169,6 +169,7 @@ class GANSuperResolution:
             48
         )
         tf.summary.image('example', example)
+        tf.summary.image('decoded', decoded)
         
         self.summary_writer = tf.summary.FileWriter('logs', self.session.graph)
         self.summary = tf.summary.merge_all()
@@ -275,7 +276,11 @@ class GANSuperResolution:
                 [9, 9], [1, 1], 'same', name = 'conv'
             )
 
-            x = tf.nn.leaky_relu(x)
+            x = tf.nn.softplus(x)
+            tf.summary.image(
+                'activation', 
+                tf.transpose(x[0:1, :, :, :], [3, 1, 2, 0]), 48
+            )
             
             x = tf.layers.conv2d_transpose(
                 x, 4, [18, 18], [2, 2], 'same', name = 'up_conv'
@@ -294,7 +299,7 @@ class GANSuperResolution:
                 [18, 18], [2, 2], 'same', name = 'down_conv'
             )
             
-            x = tf.nn.leaky_relu(x)
+            x = tf.nn.softplus(x)
             
             x = tf.layers.conv2d(
                 x, 12,
