@@ -34,7 +34,7 @@ class GANSuperResolution:
         self.learning_rate = learning_rate
         self.batch_size = batch_size
         self.continue_train = continue_train
-        self.g_filters = 128
+        self.g_filters = 64
         self.d_filters = 128
         self.checkpoint_path = "checkpoints"
         self.size = 64
@@ -206,6 +206,7 @@ class GANSuperResolution:
         
         tf.summary.scalar('generator_loss', self.g_loss)
         tf.summary.scalar('discriminator_loss', self.d_loss)
+        tf.summary.scalar('loss', self.g_loss + self.d_loss)
         tf.summary.scalar(
             'code_book_variance', 
             tf.reduce_mean(tf.sqrt(tf.nn.moments(codebook, [0])[1]))
