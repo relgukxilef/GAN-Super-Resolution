@@ -27,14 +27,14 @@ def quantize(latent, codebook):
 class GANSuperResolution:
     def __init__(
         self, session, continue_train = True, 
-        learning_rate = 1e-5,
+        learning_rate = 1e-2,
         batch_size = 128
     ):
         self.session = session
         self.learning_rate = learning_rate
         self.batch_size = batch_size
         self.continue_train = continue_train
-        self.filters = 64
+        self.filters = 128
         self.checkpoint_path = "checkpoints"
         self.size = 64
         
@@ -43,8 +43,8 @@ class GANSuperResolution:
         # build model
         print("lookup training data...")
         self.paths = glob("data/cropped/*.png")
-        np.random.shuffle(self.paths)
-                    
+        #np.random.shuffle(self.paths)
+        
         def load(path):
             image = tf.image.decode_image(tf.read_file(path), 4)
             return tf.random_crop(image, [self.size + 10, self.size + 10, 4])
@@ -113,20 +113,25 @@ class GANSuperResolution:
             initializer = tf.initializers.random_uniform(-1, 1)
         )
         
-        encoded = tf.clip_by_value(self.encode(real), -1, 1)
-        quantized, code = quantize(encoded, codebook)
+        encoded = self.encode(real)
+        #quantized, code = quantize(encoded, codebook)
+        quantized = (
+            tf.clip_by_value(encoded, -1, 1) + 
+            tf.random_normal(tf.shape(encoded))
+        )
         decoded = self.decode(downscaled, quantized)
         
         # losses
-        self.color_loss = tf.reduce_mean(tf.squared_difference(real, decoded))
+        per_pixel_loss = tf.squared_difference(real, decoded)
+        self.color_loss = tf.reduce_mean(per_pixel_loss)
 
         self.loss = sum([
             self.color_loss,
-            tf.reduce_mean(tf.squared_difference(tf.stop_gradient(encoded), code)),
+            #tf.reduce_mean(tf.squared_difference(tf.stop_gradient(encoded), code)),
         ])
         
-        #optimizer = tf.train.GradientDescentOptimizer(self.learning_rate)
-        optimizer = tf.train.AdamOptimizer(self.learning_rate)
+        optimizer = tf.train.GradientDescentOptimizer(self.learning_rate)
+        #optimizer = tf.train.AdamOptimizer(self.learning_rate, 0.0)
         #optimizer = tf.train.MomentumOptimizer(learning_rate, 0.9, use_nesterov = True)
         #optimizer = tf.contrib.opt.AddSignOptimizer()
         
@@ -142,12 +147,8 @@ class GANSuperResolution:
         )])
         example = self.xyz2srgb(self.decode(
             example_image, 
-            tf.gather(
-                codebook, 
-                tf.random_uniform(
-                    example_image.shape[:-1], 0, codebook.shape[0], tf.int32
-                )
-            )
+            tf.random.normal([1, 175, 175, 12]) + 
+            tf.random_uniform([1, 175, 175, 12], -1, 1)
         ))
         
         tf.summary.scalar('loss', self.loss)
@@ -276,14 +277,14 @@ class GANSuperResolution:
                 [9, 9], [1, 1], 'same', name = 'conv'
             )
 
-            x = tf.nn.softplus(x)
+            x = tf.nn.relu(x) * 2
             tf.summary.image(
                 'activation', 
                 tf.transpose(x[0:1, :, :, :], [3, 1, 2, 0]), 48
             )
             
             x = tf.layers.conv2d_transpose(
-                x, 4, [18, 18], [2, 2], 'same', name = 'up_conv'
+                x, 4, [2, 2], [2, 2], 'same', name = 'up_conv'
             )
 
             return x * 0.5 + 0.5
@@ -299,11 +300,11 @@ class GANSuperResolution:
                 [18, 18], [2, 2], 'same', name = 'down_conv'
             )
             
-            x = tf.nn.softplus(x)
+            x = tf.nn.relu(x) * 2
             
             x = tf.layers.conv2d(
                 x, 12,
-                [9, 9], [1, 1], 'same', name = 'conv'
+                [1, 1], [1, 1], 'same', name = 'conv'
             )
 
             return x
